@@ -1105,9 +1105,8 @@ Advanced Usage:
   --help                         This help text
   --config path/to/config.sh     Check a config other than ASGS_CONFIG
   --list vars                    Summary of required variables and descriptions
-  --list disallowed              Summary of variables forbidden to be skipping file: '900': no matches found
-in ASGS_CONFIG,
-                                 because they conflict with important environmental variables
+  --list disallowed              Summary of variables forbidden because they conflict
+                                 with important environmental variables
 
 Maintenance Note:
 
