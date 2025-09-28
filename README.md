@@ -6,6 +6,8 @@ A very strict static ASGS configuration file checker.
 
 Please record as an [ASGS Issue](https://github.com/StormSurgeLive/asgs/issues) - https://github.com/StormSurgeLive/asgs/issues
 
+Be sure to us the [asgs-lint](https://github.com/StormSurgeLive/asgs/issues?q=is%3Aissue%20state%3Aopen%20label%3Aasgs-lint) label.
+
 ## Quick Start
 
 No options are required if `ASGS_CONFIG` is set:
