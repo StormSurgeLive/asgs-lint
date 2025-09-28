@@ -2,6 +2,10 @@
 
 A very strict static ASGS configuration file checker.
 
+## Issues - Feature Requests, Bugs, Etc
+
+Please record as an [ASGS Issue](https://github.com/StormSurgeLive/asgs/issues) - https://github.com/StormSurgeLive/asgs/issues
+
 ## Quick Start
 
 No options are required if `ASGS_CONFIG` is set:
