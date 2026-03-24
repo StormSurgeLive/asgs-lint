@@ -8,6 +8,7 @@ package bin::asgslint;
 
 use Cwd qw/abs_path/;
 use Util::H2O::More qw/h2o Getopt2h2o ddd/;
+use Encode ();
 
 our $VERSION = q{1.0.0};
 
@@ -41,7 +42,8 @@ my $ADCIRC_VERSION      = undef;
 
 my $assert_checks = {
     fatal_filecheck_ASGS_CONFIG                                      => 1,     # ensures $ASGS_CONFIG exists
-    fatal_configcheck_asgsh_vars                                     => 3,     # fatal if any of these exist in config since they are tracked by the profile
+    fatal_encodingcheck_ASGS_CONFIG                                  => 2,     # ensures $ASGS_CONFIG doesn't contain Windows-specific endings 
+    fatal_configcheck_asgsh_vars                                     => 3,     # fatal if any of these exist in config since
     fatal_configcheck_GRIDNAME                                       => 5,     # fatal if GRIDNAME doesn't exist 
     maybe_fatal_configcheck_missing                                  => 8,     # checks $ASGS_CONFIG/ENV for required variables
     fatal_configcheck_FORCINGS                                       => 10,    # sanity check on TROPICALCYCLONE
@@ -342,6 +344,59 @@ sub fatal_filecheck_ASGS_CONFIG {
         sprintf qq{ASGS_CONFIG: '%s' doesn't exist or can't be found.},
         $ASGS_CONFIG
     ) if not -e $ASGS_CONFIG;
+    return EXIT_SUCCESS;
+}
+
+sub fatal_encodingcheck_ASGS_CONFIG {
+    my ( $self, $o ) = @_;
+
+    my $file = $ENV{ASGS_CONFIG};
+
+    # --- basic checks ---
+    assert_FATAL(qq{ASGS_CONFIG: not defined.}) unless defined $file;
+    assert_FATAL(qq{ASGS_CONFIG: file '$file' does not exist.}) unless -e $file;
+    assert_FATAL(qq{ASGS_CONFIG: file '$file' is not readable.}) unless -r $file;
+
+    # --- read raw bytes ---
+    open my $fh, '<:raw', $file
+        or assert_FATAL(qq{ASGS_CONFIG: cannot open '$file': $!});
+
+    local $/;
+    my $data = <$fh>;
+    close $fh;
+
+    # --- check for NUL bytes (binary contamination) ---
+    if ( $data =~ /\x00/ ) {
+        assert_FATAL(qq{ASGS_CONFIG: contains NUL (binary) bytes.});
+    }
+
+    # --- check for Windows CRLF line endings ---
+    if ( $data =~ /\r\n/ ) {
+        assert_FATAL(qq{ASGS_CONFIG: contains Windows (CRLF) line endings.});
+    }
+
+    # --- check for old Mac CR-only line endings ---
+    # (CR not followed by LF)
+    if ( $data =~ /\r(?!\n)/ ) {
+        assert_FATAL(qq{ASGS_CONFIG: contains old Mac (CR) line endings.});
+    }
+
+    # --- validate UTF-8 (or ASCII) ---
+    # ASCII is valid UTF-8, so this covers both
+    my $decoded;
+    eval {
+        require Encode;
+        $decoded = Encode::decode('UTF-8', $data, Encode::FB_CROAK);
+        1;
+    } or do {
+        assert_FATAL(qq{ASGS_CONFIG: invalid UTF-8 encoding detected.});
+    };
+
+    # --- optional: ensure only printable text (no control chars except \n and \t) ---
+    if ( $decoded =~ /[^\x09\x0A\x20-\x7E]/ ) {
+        assert_FATAL(qq{ASGS_CONFIG: contains non-printable or invalid control characters.});
+    }
+
     return EXIT_SUCCESS;
 }
 
@@ -1073,7 +1128,7 @@ sub _extract_from_statefile {
 
 sub assert_FATAL($) {
     my $MSG = shift;
-    my $errmsg = qq{(!!! assert_FATAL): $MSG\n ... fix and rerun linter\n};
+    my $errmsg = qq{(!!! assert_FATAL): $MSG};
     push @$ERRORS, $errmsg;
 }
 
