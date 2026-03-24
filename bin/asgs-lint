@@ -2,6 +2,7 @@
 
 use strict;
 use warnings;
+use v5.12;
 
 package bin::asgslint;
 
@@ -14,6 +15,8 @@ use constant {
     EXIT_SUCCESS => 0,
     EXIT_ERROR   => 255,
 };
+
+my $ERRORS = [];                      # accumulate errors so we fail after detecting all errors
 
 # Expected variables in %ENV
 my $SCRIPTDIR           = $ENV{SCRIPTDIR};
@@ -1070,8 +1073,8 @@ sub _extract_from_statefile {
 
 sub assert_FATAL($) {
     my $MSG = shift;
-    warn qq{(!!! assert_FATAL): $MSG\n ... fix and rerun linter\n};
-    exit EXIT_ERROR;
+    my $errmsg = qq{(!!! assert_FATAL): $MSG\n ... fix and rerun linter\n};
+    push @$ERRORS, $errmsg;
 }
 
 sub _show_help {
@@ -1159,7 +1162,11 @@ sub run {
         $self->$check($o);
     }
 
-    return EXIT_SUCCESS;
+    for my $error (@$ERRORS) {
+      say $error;
+    }
+
+    return (@$ERRORS) ? EXIT_ERROR : EXIT_SUCCESS;
 }
 
 exit run( \@ARGV // [] ) if not caller;
