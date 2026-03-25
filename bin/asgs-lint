@@ -104,7 +104,12 @@ my $CONFIG_VARS = {
         check => [],
         hint  => q{Must be defined, no spaces},
     },
-    ASGSADMIN => { ord => 5, req => 0, check => [], hint => q{must be an email address}, },
+    ASGSADMIN => {
+        ord   => 5,
+        req   => 0,
+        check => [ sub { _LOOKS_LIKE_EMAIL_ADDRESS(@_) } ],
+        hint => q{must be an email address},
+    },
     PPN       => {
         ord   => 10,
         req   => 0,
@@ -306,7 +311,7 @@ my $CONFIG_VARS = {
     RIVERSITE => {
         ord   => 151,
         req   => 0,
-        check => [ sub { _LOOKS_LIKE_REMOTE_HOST( @_ ) } ],
+        check => [ sub { _LOOKS_LIKE_REMOTE_HOST(@_) } ],
         hint  => q{If VARFLUX=on, RIVERSITE may be used to define the server from which river boundary data may be gotten as a fort.20.},
     },
     RIVERDIR => {
@@ -1103,6 +1108,34 @@ sub _LOOKS_LIKE_REMOTE_HOST {
     if ( not $CFG_VALUE =~ m/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/
          and not $CFG_VALUE =~ m/^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/) {
       return undef;
+    }
+    return 1;
+}
+
+sub _LOOKS_LIKE_EMAIL_ADDRESS {
+    my ( $self, $o, $var ) = @_;
+
+    my $var_found;
+    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
+
+    # must exist
+    return undef unless defined $CFG_VALUE and length $CFG_VALUE;
+
+    # basic email validation
+    if (
+        not $CFG_VALUE =~ m{
+            ^
+            [A-Za-z0-9._%+\-]+            # local part
+            \@
+            (?:[A-Za-z0-9]                # domain labels
+               (?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?
+               \.
+            )+
+            [A-Za-z]{2,}                  # TLD
+            $
+        }x
+    ) {
+        return undef;
     }
     return 1;
 }
