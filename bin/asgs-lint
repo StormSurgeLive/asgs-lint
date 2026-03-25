@@ -255,6 +255,12 @@ my $CONFIG_VARS = {
         check => [ sub { \&_DEFER_CHECK } ],
         hint  => q{specifies number of storms scenarios to be running in addition to a hindcast and a nowcast},
     },
+    QUALITYSETTING => {
+        ord   => 117,
+        req   => 0,
+        check => [ sub { _IN( @_, qw/strict allow-nonfatal-instability/ ) } ],
+        hint  => q{If defined in config, must be: 'strict' or 'allow-nonfatal-instability'.},
+    },
     QUEUESYS => {
         ord   => 120,
         req   => 0,
