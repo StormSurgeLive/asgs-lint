@@ -64,17 +64,17 @@ my $assert_checks = {
 #--
 #    TRIGGER must be ftp, rss, rssembedded, or atcf.
 #    NCPUCAPACITY must be greater than or at least equal to NCPU plus NUMWRITERS for each individual scenario.
-#    BACKGROUNDMET set to something other than allowable values : on, NAM, OWI, namBlend,n GFS, gfsBlend, and off.
-#    BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend when TROPICALCYCLONE is set to something other than off.
+#    BACKGROUNDMET must set to allowable values : on, NAM, OWI, namBlend, GFS, gfsBlend, RRFS, rrfsBlend, and off.
+#    BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend, or rrfsBlend when TROPICALCYCLONE is set to something other than off.
 #    TROPICALCYCLONE and BACKGROUNDMET cannot both be on simultaneously
 #    TROPICALCYCLONE and BACKGROUNDMET cannot both be off simultaneously
 #    LASTSUBDIR cannot be set to null in the config file if the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart), and the STATEFILE does not exist.
 #    LASTSUBDIR cannot be set to null in the STATEFILE file if it exists and the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart).
 #
 #Done, Optional, if defined
-#    VORTEXMODEL parameter set to something other than SYMMETRIC, ASYMMETRIC, and GAHM.
 #    QUEUESYS must be serial, mpiexec, SLURM, or PBS.
-#    VORTEXMODEL parameter set to something other than GAHM when BACKGROUNDMET set to namBlendor gfsBlend.
+#    VORTEXMODEL parameter must set to SYMMETRIC, ASYMMETRIC, and GAHM.
+#    VORTEXMODEL parameter must be set to something other than GAHM when BACKGROUNDMET set to namBlend, gfsBlend, or rrfsBlend.
 #    if VARFLUX=on or VARFLUX=default for any ADCIRC version,
 #    if WAVES=on and SWANDT is sent in config, it must be in the range, 300 to 1200
 #    if WAVES=on and REINITIALIZESWAN is set in config, it must be either 'on' or 'off'
@@ -150,8 +150,8 @@ my $CONFIG_VARS = {
     BACKGROUNDMET => {
         ord   => 45,
         req   => 1,
-        check => [ sub { _IN( @_, qw/on off NAM OWI namBlend GFS gfsBlend/ ) } ],
-        hint  => q{Must be: 'on', 'off', 'NAM', 'OWI', 'namBlend', 'GFS', or 'gfsBlend'},
+        check => [ sub { _IN( @_, qw/on off NAM OWI namBlend GFS gfsBlend RRFS rrfsBlend/ ) } ],
+        hint  => q{Must be: 'on', 'off', 'NAM', 'OWI', 'namBlend', 'GFS', 'gfsBlend', 'RRFS', or 'rrfsBlend'},
     },
     TROPICALCYCLONE => {
         ord   => 50,
@@ -473,10 +473,10 @@ sub fatal_configcheck_FORCINGS {
         $ASGS_CONFIG
     ) if ( $BACKGROUNDMET eq $TROPICALCYCLONE );
 
-    #hint: BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend when TROPICALCYCLONE is set to something other than off.
-    if ( $TROPICALCYCLONE eq q{off} and grep { $_ =~ m/$BACKGROUNDMET/ } (qw/off namBlend gfsBlend/) ) {
+    #hint: BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend, rrfsBlend when TROPICALCYCLONE is set to something other than off.
+    if ( $TROPICALCYCLONE eq q{off} and grep { $_ =~ m/$BACKGROUNDMET/ } (qw/off namBlend gfsBlend rrfsBlend/) ) {
         assert_FATAL(
-            sprintf qq{BACKGROUNDMET can't be set to 'off', 'namBlend', 'gfsBlend' if TROPICALCYCLONE is 'off' in '%s'},
+            sprintf qq{BACKGROUNDMET can't be set to 'off', 'namBlend', 'gfsBlend', or 'rrfsBlend' if TROPICALCYCLONE is 'off' in '%s'},
             $ASGS_CONFIG
         );
     }
@@ -544,10 +544,10 @@ sub fatal_configcheck_VORTEXMODEL_if_DEFINED {
     # $VORTEXMODEL is optional and may not be defined
     return EXIT_SUCCESS if not $VORTEXMODEL;
 
-    #hint: VORTEXMODEL parameter set to something other than GAHM when BACKGROUNDMET set to namBlend.
-    if ( $VORTEXMODEL eq q{GAHM} and ($BACKGROUNDMET eq q{namBlend} or $BACKGROUNDMET eq q{gfsBlend} )) {
+    #hint: VORTEXMODEL parameter set to something other than GAHM when BACKGROUNDMET set to namBlend, gfsBlend, or rrfsBlend.
+    if ( $VORTEXMODEL eq q{GAHM} and (grep { $_ =~ m/$BACKGROUNDMET/ } (qw/namBlend gfsBlend rrfsBlend/) )) {
         assert_FATAL(
-            sprintf qq{VORTEXMODEL can't be 'GAHM' when BACKGROUNDMET is 'namBlend' or 'gfsBlend' in '%s'.},
+            sprintf qq{VORTEXMODEL can't be 'GAHM' when BACKGROUNDMET is 'namBlend', 'gfsBlend', or 'rrfsBlend' in '%s'.},
             $ASGS_CONFIG
         );
     }
