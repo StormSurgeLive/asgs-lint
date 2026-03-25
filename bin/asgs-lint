@@ -333,7 +333,18 @@ my $CONFIG_VARS = {
         check => [ sub { not _IS_ABSOLUTE_PATH(@_) } ],
         hint  => q{File path unwhich archives will be placed; ADCIRCDIR must be a relative path to $ARCHIVEBASE and will be created if it doesn't exist.},
     },
-
+    PREPPEDARCHIVE => {
+        ord   => 170,
+        req   => 1,
+        check => [ \&_DEFER_CHECK ],
+        hint  => q{PREPPEDARCHIVE must be defined, it is the name of the .tgz file that stores the archive of prepared files used for each run.},
+    },
+    HINDCASTARCHIVE => {
+        ord   => 175,
+        req   => 1,
+        check => [ \&_DEFER_CHECK ],
+        hint  => q{HINDCASTARCHIVE must be defined, it is the name of the .tgz file that stores the results of the initial hindcast performed when ASGS is first started.},
+    },
 };
 
 # NONE of these variables should ever appear in a configuration file
