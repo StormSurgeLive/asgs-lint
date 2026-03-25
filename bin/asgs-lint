@@ -1103,18 +1103,66 @@ sub _LOOKS_LIKE_REMOTE_HOST {
 # returns a list; first variable is if the $var exists in $ASGS_CONFIG; the
 # second is the value of the assignment (undef if anything is on the RHS of
 # the '='
+# Handles:
+#   FOO=bar
+#   export FOO=bar
+#   FOO="bar baz"
+#   FOO='bar baz'
+#   FOO=
+#   POSTPROCESS=( includeWind10m.sh createOPeNDAPFileList.sh $OPENDAPPOST )
+#   POSTPROCESS=("a b" c '$D')
 sub _extract_from_string {
     my ( $self, $varname, $text ) = @_;
-    $text =~ m/^\s*($varname)=([\w."\)\(\$}{\/:-]+)\s*#?/m;
-    return ( $1, $2 );
+
+    my $re_var = quotemeta($varname);
+
+    if (
+        $text =~ m{
+            ^\s*
+            (?:export\s+)?                  # optional export
+            ($re_var)                       # variable name
+            \s*=\s*
+            (?:
+                "((?:\\.|[^"])*)"           # double-quoted value
+              | '([^']*)'                   # single-quoted value
+              | (\(
+                    (?:
+                        [^()"'\\]           # ordinary chars
+                      | \\ .                # backslash escape
+                      | " (?:\\.|[^"])* "   # quoted chunk inside array
+                      | ' [^']* '           # single-quoted chunk inside array
+                    )*
+                 \))                        # bash-style single-line array/list
+              | ([^[:space:]#;]*)           # unquoted scalar (possibly empty)
+            )
+            \s*(?:\#.*)?                    # optional trailing comment
+            $
+        }mx
+    ) {
+        my $name  = $1;
+        my $value = defined $2 ? $2
+                  : defined $3 ? $3
+                  : defined $4 ? $4
+                  : $5;
+
+        return ( $name, $value );
+    }
+
+    return;
 }
 
 sub _extract_from_config {
     my ( $self, $varname ) = @_;
+
     local $/;
-    open my $FH, q{<}, $ASGS_CONFIG || die $!;
+    open my $FH, '<', $ASGS_CONFIG
+        or die "Could not open '$ASGS_CONFIG': $!";
+
     my $config = <$FH>;
-    close $FH;
+
+    close $FH
+        or die "Could not close '$ASGS_CONFIG': $!";
+
     return $self->_extract_from_string( $varname, $config );
 }
 
