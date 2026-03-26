@@ -7,7 +7,7 @@ use v5.12;
 package bin::asgslint;
 
 use Cwd qw/abs_path/;
-use Util::H2O::More qw/h2o Getopt2h2o ddd/;
+use Util::H2O::More qw/d2o h2o Getopt2h2o ddd/;
 use Encode ();
 
 our $VERSION = q{1.0.0};
@@ -97,22 +97,28 @@ my $assert_checks = {
 #    if RIVERDATAPROTOCOL=scp then verify that the ssh server $RIVERSITE is reachable as the user $RIVERUSER and that the directory $RIVERDIR exists and is readable
 #--
 
-my $CONFIG_VARS = {
+my $CONFIG_VARS =  d2o {
     INSTANCENAME => {
         ord   => 1,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
+        hint  => q{Must be defined, no spaces},
+    },
+    ACCOUNT => {
+        ord   => 1,
+        req   => 1,
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Must be defined, no spaces},
     },
     ASGSADMIN => {
         ord   => 5,
-        req   => 0,
+        req   => 1,
         check => [ sub { _LOOKS_LIKE_EMAIL_ADDRESS(@_) } ],
-        hint => q{must be an email address},
+        hint => q{ASGSADMIN must be an email address},
     },
     PPN       => {
         ord   => 10,
-        req   => 0,
+        req   => 1,
         check => [ \&_INT ],
         hint  => q{Must be integer greater than 0},
     },
@@ -136,20 +142,26 @@ my $CONFIG_VARS = {
     },
     QUEUENAME => {
         ord   => 30,
-        req   => 0,
-        check => [],
+        req   => 1,
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Name of the queue used for parallel compute jobs},
     },
     SERQUEUE => {
         ord   => 35,
-        req   => 0,
-        check => [],
+        req   => 1,
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Name of the queue used for single processor jobs},
+    },
+    SERQUEUE_NTASKS => {
+        ord   => 35,
+        req   => 1,
+        check => [ \&_INT ],
+        hint  => q{Number of tasks to request for serial processor jobs in order to satisfy memory requirements},
     },
     GRIDNAME => {
         ord   => 40,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{name of grid to use},
     },
     BACKGROUNDMET => {
@@ -161,7 +173,7 @@ my $CONFIG_VARS = {
     TROPICALCYCLONE => {
         ord   => 50,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Turn tropical cyclone forcing 'on' or 'off'},
     },
     TRIGGER => {
@@ -197,49 +209,49 @@ my $CONFIG_VARS = {
     INTENDEDAUDIENCE => {
         ord   => 70,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Control type of notifications, 'dev', 'general', ...},
     },
     POSTPROCESS => {
         ord   => 75,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{List of post processing scripts},
     },
     OPENDAPNOTIFY => {
         ord   => 80,
         req   => 0,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{list of *emails notified when OPENDAPPOST is run via POSTPROCESS},
     },
     OPENDAPPOST => {
         ord   => 80,
         req   => 0,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{POSTPROCESS script used by THREDDS integration (used by monitoring/logging.sh)},
     },
     NOTIFY_SCRIPT => {
         ord   => 85,
         req   => 0,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Script to handle notifications},
     },
     TDS => {
         ord   => 90,
         req   => 0,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{List of thredds servers to upload output},
     },
     COLDSTARTDATE => {
         ord   => 95,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Start date for ramping model from zero state},
     },
     HINDCASTLENGTH => {
         ord   => 100,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Length of time used to cold start},
     },
     HOTORCOLD => {
@@ -251,7 +263,7 @@ my $CONFIG_VARS = {
     LASTSUBDIR => {
         ord   => 110,
         req   => 1,
-        check => [],
+        check => [ \&_DEFER_CHECK ],
         hint  => q{Used when HOTORCOLD is 'hotstart'.},
     },
     SCENARIOPACKAGESIZE => {
@@ -336,7 +348,7 @@ my $CONFIG_VARS = {
         ord   => 165,
         req   => 0,
         check => [ sub { not _IS_ABSOLUTE_PATH(@_) } ],
-        hint  => q{File path unwhich archives will be placed; ADCIRCDIR must be a relative path to $ARCHIVEBASE and will be created if it doesn't exist.},
+        hint  => q{File path in which archives will be placed; ARCHIVEDIR must be a relative path to $ARCHIVEBASE and will be created if it doesn't exist.},
     },
     PREPPEDARCHIVE => {
         ord   => 170,
@@ -374,10 +386,20 @@ sub fatal_encodingcheck_ASGS_CONFIG {
 
     my $file = $ENV{ASGS_CONFIG};
 
-    # --- basic checks ---
-    assert_FATAL(qq{ASGS_CONFIG: not defined.}) unless defined $file;
-    assert_FATAL(qq{ASGS_CONFIG: file '$file' does not exist.}) unless -e $file;
-    assert_FATAL(qq{ASGS_CONFIG: file '$file' is not readable.}) unless -r $file;
+    if ( not defined $file or $file eq q{} ) {
+        warn(q{ASGS_CONFIG: not defined.});
+        exit EXIT_ERROR;
+    }
+
+    if ( not -e $file ) {
+        warn(qq{ASGS_CONFIG: file '$file' does not exist.});
+        exit EXIT_ERROR;
+    }
+
+    if ( not -r $file ) {
+        warn(qq{ASGS_CONFIG: file '$file' is not readable.});
+        exit EXIT_ERROR;
+    }
 
     # --- read raw bytes ---
     open my $fh, '<:raw', $file
@@ -427,7 +449,7 @@ sub fatal_configcheck_asgsh_vars {
 
     # fatal if the variable even appears, doesn't need to be defined
     foreach my $var (@$CONFIG_DISALLOWED) {
-        my ( $var_found, $value ) = $self->_extract_from_config($var);
+        my ( $var_found, $value ) = $self->_extract_from_config_no_ENV($var);
         if ($var_found) {
             assert_FATAL(
                 sprintf qq{'%s' should not exist in the config file, '%s'.},
@@ -443,15 +465,16 @@ sub maybe_fatal_configcheck_missing {
     my ( $self, $o ) = @_;
 
     # check if missing from config; ENV checks not incorporated yet since the config will override them
-    foreach my $var ( sort { $CONFIG_VARS->{$a}->{ord} <=> $CONFIG_VARS->{$b}->{ord} } keys %$CONFIG_VARS ) {
+ 
+    foreach my $var ( sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS ) {
 
         # ensure all required CONFIG_VARS are defined in ASGS_CONFIG
-        if ( $CONFIG_VARS->{$var}->{req} ) {
+        if ( $CONFIG_VARS->$var->req ) {
 
             # ensures all required (req => 1) variables are defined, skips
             # variables that are not required
             if ( not _DEFINED->( __PACKAGE__, $o, $var ) ) {
-                my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->{$var}->{hint};
+                my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->$var->hint;
                 assert_FATAL(
                     sprintf qq{'%s' not defined in '%s'!\n%s},
                     $var, $ASGS_CONFIG, $hint
@@ -461,10 +484,10 @@ sub maybe_fatal_configcheck_missing {
             # checks all defined variables, even optional ones; then runs
             # validation routines in the 'checks' field of the CONFIG_VARS hash
         }
-        foreach my $check ( @{ $CONFIG_VARS->{$var}->{check} } ) {
+        foreach my $check ( $CONFIG_VARS->$var->check->all ) {
             if ( q{CODE} eq ref $check and _DEFINED->( __PACKAGE__, $o, $var ) ) {
                 if ( not $check->( __PACKAGE__, $o, $var ) ) {
-                    my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->{$var}->{hint};
+                    my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->$var->hint;
                     assert_FATAL(
                         sprintf qq{'%s' check failed in '%s'!\n%s},
                         $var, $ASGS_CONFIG, $hint
@@ -855,7 +878,7 @@ sub fatal_configcheck_WAVES_if_on {
         and (  not -e sprintf( q{%s/%s}, $SCRIPTDIR, q{swaninit.template} )
             or not -e sprintf( q{%s/%s}, $SCRIPTDIR, $SWANTEMPLATE ) )
     ) {
-        assert_FATAL( $CONFIG_VARS->{SWANTEMPLATE}->{hint} );
+        assert_FATAL( $CONFIG_VARS->SWANTEMPLATE->hint );
     }
 
     return 1;
@@ -1004,8 +1027,11 @@ sub _INT {
     my ( $self, $o, $var ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( int $CFG_VALUE < 1 ) {
+    {
+      no warnings 'numeric';
+      if ( int $CFG_VALUE < 1 ) {
         return undef;
+      }
     }
     return 1;
 }
@@ -1015,8 +1041,11 @@ sub _IS_ONE {
     my ( $self, $o, $var ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( int $CFG_VALUE != 1 ) {
-        return undef;
+    {
+      no warnings 'numeric';
+      if ( int $CFG_VALUE != 1 ) {
+          return undef;
+      }
     }
     return 1;
 }
@@ -1026,8 +1055,11 @@ sub _IS_IN_RANGE {
     my ( $self, $o, $var, $min, $max ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( int $CFG_VALUE < $min or int $CFG_VALUE > $max ) {
-        return undef;
+    {
+      no warnings 'numeric';
+      if ( int $CFG_VALUE < $min or int $CFG_VALUE > $max ) {
+          return undef;
+      }
     }
     return 1;
 }
@@ -1093,7 +1125,7 @@ sub _IS_ABSOLUTE_PATH {
     my ( $self, $o, $var ) = @_; 
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( not $CFG_VALUE =~ m/^\// ) {
+    if ( $CFG_VALUE !~ m{^/} ) {
       return undef;
     }
     return 1;
@@ -1195,6 +1227,23 @@ sub _extract_from_string {
     return;
 }
 
+sub _extract_from_config_no_ENV {
+    my ( $self, $varname ) = @_;
+
+    local $/;
+    open my $FH, '<', $ASGS_CONFIG
+        or die "Could not open '$ASGS_CONFIG': $!";
+
+    my $config = <$FH>;
+
+    close $FH
+        or die "Could not close '$ASGS_CONFIG': $!";
+
+    my ($name, $value) = $self->_extract_from_string( $varname, $config );
+
+    return ($name, $value);
+}
+
 sub _extract_from_config {
     my ( $self, $varname ) = @_;
 
@@ -1207,7 +1256,13 @@ sub _extract_from_config {
     close $FH
         or die "Could not close '$ASGS_CONFIG': $!";
 
-    return $self->_extract_from_string( $varname, $config );
+    my ($name, $value) = $self->_extract_from_string( $varname, $config );
+
+    if (not $value and $value = $ENV{$varname}) {
+      $name = $varname;
+    }
+
+    return ($name, $value);
 }
 
 # hint: STATEFILE should only be defined in the environment and set by asgs_main.sh
@@ -1291,9 +1346,9 @@ sub run {
     }
 
     if ( $o->list and $o->list eq q{vars} ) {
-        foreach my $var ( sort { $CONFIG_VARS->{$a}->{ord} <=> $CONFIG_VARS->{$b}->{ord} } keys %$CONFIG_VARS ) {
-            my $req = ( $CONFIG_VARS->{$var}->{req} ) ? q{[required]} : q{[optional]};
-            printf qq{%s %-19s %s\n}, $req, $var, $CONFIG_VARS->{$var}->{hint};
+        foreach my $var ( sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS ) {
+            my $req = ( $CONFIG_VARS->$var->req ) ? q{[required]} : q{[optional]};
+            printf qq{%s %-19s %s\n}, $req, $var, $CONFIG_VARS->$var->hint;
         }
         return EXIT_SUCCESS;
     }
