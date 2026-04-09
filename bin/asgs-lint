@@ -42,15 +42,15 @@ my $ADCIRC_VERSION      = undef;
 
 my $assert_checks = {
     fatal_filecheck_ASGS_CONFIG                                      => 1,     # ensures $ASGS_CONFIG exists
-    fatal_encodingcheck_ASGS_CONFIG                                  => 2,     # ensures $ASGS_CONFIG doesn't contain Windows-specific endings 
+    fatal_encodingcheck_ASGS_CONFIG                                  => 2,     # ensures $ASGS_CONFIG doesn't contain Windows-specific endings
     fatal_configcheck_asgsh_vars                                     => 3,     # fatal if any of these exist in config since
-    fatal_configcheck_GRIDNAME                                       => 5,     # fatal if GRIDNAME doesn't exist 
+    fatal_configcheck_GRIDNAME                                       => 5,     # fatal if GRIDNAME doesn't exist
     maybe_fatal_configcheck_missing                                  => 8,     # checks $ASGS_CONFIG/ENV for required variables
-    fatal_configcheck_FORCINGS                                       => 10,    # sanity check on TROPICALCYCLONE
-    fatal_configcheck_CPUs                                           => 15,    # sanity check on requests CPUs
+    fatal_configcheck_FORCINGS                                       => 10,    # sanity check on TROPICALCYCLONE / BACKGROUNDMET
+    fatal_configcheck_CPUs                                           => 15,    # sanity check on requested CPUs
     fatal_configcheck_HOTORCOLD                                      => 20,    # sanity check for configured hotstarts, inspects STATEFILE if exists
     fatal_configcheck_VORTEXMODEL_if_DEFINED                         => 25,    # ensures VORTEXMODEL setting, if defined in config, is consistent with BACKGROUNDMET
-    fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED => 30,    # sanity check for scenerio package definition, so op doesn't mismatch SCENERIOPACKAGESIZE
+    fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED => 30,    # sanity check for scenario package definition, so op doesn't mismatch SCENARIOPACKAGESIZE
     fatal_bincheck_ADCIRC                                            => 35,    # ensures ADCIRC bins are available via PATH
     query_ADCIRC_version                                             => 37,    # sets ADCIRC version, making it available globally
     fatal_configcheck_WAVES_if_on                                    => 40,    # ensures SWAN bins are in PATH no-op if WAVES=off
@@ -66,8 +66,8 @@ my $assert_checks = {
 #    NCPUCAPACITY must be greater than or at least equal to NCPU plus NUMWRITERS for each individual scenario.
 #    BACKGROUNDMET must set to allowable values : on, NAM, OWI, namBlend, GFS, gfsBlend, RRFS, rrfsBlend, and off.
 #    BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend, or rrfsBlend when TROPICALCYCLONE is set to something other than off.
-#    TROPICALCYCLONE and BACKGROUNDMET cannot both be on simultaneously
-#    TROPICALCYCLONE and BACKGROUNDMET cannot both be off simultaneously
+#    TROPICALCYCLONE and BACKGROUNDMET cannot both be on simultaneously.
+#    TROPICALCYCLONE and BACKGROUNDMET cannot both be off simultaneously.
 #    LASTSUBDIR cannot be set to null in the config file if the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart), and the STATEFILE does not exist.
 #    LASTSUBDIR cannot be set to null in the STATEFILE file if it exists and the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart).
 #
@@ -299,7 +299,7 @@ my $CONFIG_VARS =  d2o {
         ord   => 135,
         req   => 0,
         check => [ \&_DEFER_CHECK ],
-        hint  => q{If defined and WAVES=on, must be: 'no' or 'yes'.},
+        hint  => q{If defined and WAVES=on, must be: 'on' or 'off'.},
     },
     SWANTEMPLATE => {
         ord   => 140,
@@ -394,7 +394,6 @@ sub fatal_encodingcheck_ASGS_CONFIG {
         exit EXIT_ERROR;
     }
 
-    # --- read raw bytes ---
     open my $fh, '<:raw', $file
         or assert_FATAL(qq{ASGS_CONFIG: cannot open '$file': $!});
 
@@ -402,24 +401,18 @@ sub fatal_encodingcheck_ASGS_CONFIG {
     my $data = <$fh>;
     close $fh;
 
-    # --- check for NUL bytes (binary contamination) ---
     if ( $data =~ /\x00/ ) {
         assert_FATAL(qq{ASGS_CONFIG: contains NUL (binary) bytes.});
     }
 
-    # --- check for Windows CRLF line endings ---
     if ( $data =~ /\r\n/ ) {
         assert_FATAL(qq{ASGS_CONFIG: contains Windows (CRLF) line endings.});
     }
 
-    # --- check for old Mac CR-only line endings ---
-    # (CR not followed by LF)
     if ( $data =~ /\r(?!\n)/ ) {
         assert_FATAL(qq{ASGS_CONFIG: contains old Mac (CR) line endings.});
     }
 
-    # --- validate UTF-8 (or ASCII) ---
-    # ASCII is valid UTF-8, so this covers both
     my $decoded;
     eval {
         require Encode;
@@ -429,7 +422,6 @@ sub fatal_encodingcheck_ASGS_CONFIG {
         assert_FATAL(qq{ASGS_CONFIG: invalid UTF-8 encoding detected.});
     };
 
-    # --- optional: ensure only printable text (no control chars except \n and \t) ---
     if ( $decoded =~ /[^\x09\x0A\x20-\x7E]/ ) {
         assert_FATAL(qq{ASGS_CONFIG: contains non-printable or invalid control characters.});
     }
@@ -440,7 +432,6 @@ sub fatal_encodingcheck_ASGS_CONFIG {
 sub fatal_configcheck_asgsh_vars {
     my ( $self, $o ) = @_;
 
-    # fatal if the variable even appears, doesn't need to be defined
     foreach my $var (@$CONFIG_DISALLOWED) {
         my ( $var_found, $value ) = $self->_extract_from_config_no_ENV($var);
         if ($var_found) {
@@ -457,15 +448,8 @@ sub fatal_configcheck_asgsh_vars {
 sub maybe_fatal_configcheck_missing {
     my ( $self, $o ) = @_;
 
-    # check if missing from config; ENV checks not incorporated yet since the config will override them
- 
     foreach my $var ( sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS ) {
-
-        # ensure all required CONFIG_VARS are defined in ASGS_CONFIG
         if ( $CONFIG_VARS->$var->req ) {
-
-            # ensures all required (req => 1) variables are defined, skips
-            # variables that are not required
             if ( not _DEFINED->( __PACKAGE__, $o, $var ) ) {
                 my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->$var->hint;
                 assert_FATAL(
@@ -473,9 +457,6 @@ sub maybe_fatal_configcheck_missing {
                     $var, $ASGS_CONFIG, $hint
                 );
             }
-
-            # checks all defined variables, even optional ones; then runs
-            # validation routines in the 'checks' field of the CONFIG_VARS hash
         }
         foreach my $check ( $CONFIG_VARS->$var->check->all ) {
             if ( q{CODE} eq ref $check and _DEFINED->( __PACKAGE__, $o, $var ) ) {
@@ -496,22 +477,37 @@ sub maybe_fatal_configcheck_missing {
 sub fatal_configcheck_FORCINGS {
     my ( $self, $o ) = @_;
 
-    my $var_found;
-    ( $var_found, my $BACKGROUNDMET )   = $self->_extract_from_config(q{BACKGROUNDMET});
-    ( $var_found, my $TROPICALCYCLONE ) = $self->_extract_from_config(q{TROPICALCYCLONE});
+    my ( undef, $BACKGROUNDMET )   = $self->_extract_from_config(q{BACKGROUNDMET});
+    my ( undef, $TROPICALCYCLONE ) = $self->_extract_from_config(q{TROPICALCYCLONE});
+
+    my %bg_allowed = map { $_ => 1 } qw/on off NAM OWI namBlend GFS gfsBlend RRFS rrfsBlend/;
+    my %tc_allowed = map { $_ => 1 } qw/on off/;
+    my %blend_bg   = map { $_ => 1 } qw/namBlend gfsBlend rrfsBlend/;
 
     assert_FATAL(
-        sprintf qq{BACKGROUNDMET and TROPICALCYCLONE can't both be the same value},
-        $ASGS_CONFIG
-    ) if ( $BACKGROUNDMET eq $TROPICALCYCLONE );
+        sprintf qq{BACKGROUNDMET '%s' is invalid in '%s'.},
+        defined $BACKGROUNDMET ? $BACKGROUNDMET : q{undef}, $ASGS_CONFIG
+    ) if !defined $BACKGROUNDMET || !$bg_allowed{$BACKGROUNDMET};
 
-    #hint: BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend, rrfsBlend when TROPICALCYCLONE is set to something other than off.
-    if ( $TROPICALCYCLONE eq q{off} and grep { $_ =~ m/$BACKGROUNDMET/ } (qw/off namBlend gfsBlend rrfsBlend/) ) {
-        assert_FATAL(
-            sprintf qq{BACKGROUNDMET can't be set to 'off', 'namBlend', 'gfsBlend', or 'rrfsBlend' if TROPICALCYCLONE is 'off' in '%s'},
-            $ASGS_CONFIG
-        );
-    }
+    assert_FATAL(
+        sprintf qq{TROPICALCYCLONE '%s' is invalid in '%s'.},
+        defined $TROPICALCYCLONE ? $TROPICALCYCLONE : q{undef}, $ASGS_CONFIG
+    ) if !defined $TROPICALCYCLONE || !$tc_allowed{$TROPICALCYCLONE};
+
+    assert_FATAL(
+        sprintf qq{BACKGROUNDMET and TROPICALCYCLONE cannot both be 'off' in '%s'.},
+        $ASGS_CONFIG
+    ) if $BACKGROUNDMET eq q{off} && $TROPICALCYCLONE eq q{off};
+
+    assert_FATAL(
+        sprintf qq{BACKGROUNDMET '%s' requires TROPICALCYCLONE='on' in '%s'.},
+        $BACKGROUNDMET, $ASGS_CONFIG
+    ) if $blend_bg{$BACKGROUNDMET} && $TROPICALCYCLONE ne q{on};
+
+    assert_FATAL(
+        sprintf qq{BACKGROUNDMET='on' and TROPICALCYCLONE='on' are not compatible in '%s'.},
+        $ASGS_CONFIG
+    ) if $BACKGROUNDMET eq q{on} && $TROPICALCYCLONE eq q{on};
 
     return 1;
 }
@@ -525,7 +521,6 @@ sub fatal_configcheck_CPUs {
     ( $var_found, my $NUMWRITERS )   = $self->_extract_from_config(q{NUMWRITERS});
     ( $var_found, my $NCPUCAPACITY ) = $self->_extract_from_config(q{NCPUCAPACITY});
 
-    #hint: NCPU+NUMWRITER can't exceed NCPUCAPACITY.
     assert_FATAL(
         sprintf qq{NCPU+NUMWRITER exceeds NCPUCAPACITY in '%s'},
         $ASGS_CONFIG
@@ -541,7 +536,6 @@ sub fatal_configcheck_HOTORCOLD {
     ( $var_found, my $LASTSUBDIR ) = $self->_extract_from_config(q{LASTSUBDIR});
     ( $var_found, my $HOTORCOLD )  = $self->_extract_from_config(q{HOTORCOLD});
 
-    #hint: LASTSUBDIR cannot be set to null in the config file if the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart), and the STATEFILE does not exist.
     if ( ( not $LASTSUBDIR or $LASTSUBDIR eq q{null} ) and $HOTORCOLD eq q{hotstart} and ( not $STATEFILE or not -e $STATEFILE ) ) {
         assert_FATAL(
             sprintf qq{LASTSUBDIR can't be 'null' if HOTORCOLD=hotstart in '%s' and STATEFILE doesn't exist.},
@@ -549,7 +543,6 @@ sub fatal_configcheck_HOTORCOLD {
         );
     }
 
-    #hint: LASTSUBDIR cannot be set to null in the STATEFILE file if it exists and the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart).
     if ( $STATEFILE and -e $STATEFILE ) {
         my $var_found;
         ( $var_found, my $LASTSUBDIR ) = $self->_extract_from_statefile(q{LASTSUBDIR});
@@ -573,10 +566,8 @@ sub fatal_configcheck_VORTEXMODEL_if_DEFINED {
     my ( $var_found, $BACKGROUNDMET ) = $self->_extract_from_config(q{BACKGROUNDMET});
     ( $var_found, my $VORTEXMODEL ) = $self->_extract_from_config(q{VORTEXMODEL});
 
-    # $VORTEXMODEL is optional and may not be defined
     return EXIT_SUCCESS if not $VORTEXMODEL;
 
-    #hint: VORTEXMODEL parameter set to something other than GAHM when BACKGROUNDMET set to namBlend, gfsBlend, or rrfsBlend.
     if ( $VORTEXMODEL eq q{GAHM} and (grep { $_ =~ m/$BACKGROUNDMET/ } (qw/namBlend gfsBlend rrfsBlend/) )) {
         assert_FATAL(
             sprintf qq{VORTEXMODEL can't be 'GAHM' when BACKGROUNDMET is 'namBlend', 'gfsBlend', or 'rrfsBlend' in '%s'.},
@@ -594,10 +585,8 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
     my ( $var_found, $TROPICALCYCLONE ) = $self->_extract_from_config(q{TROPICALCYCLONE});
     ( $var_found, my $SCENARIOPACKAGESIZE ) = $self->_extract_from_config(q{SCENARIOPACKAGESIZE});
 
-    # $SCENARIOPACKAGESIZE is optional and may not be defined
     return EXIT_SUCCESS if not $TROPICALCYCLONE;
 
-    #hint: SCENARIOPACKAGESIZE parameter set to something other than GAHM when BACKGROUNDMET set to namBlend.
     if ( $SCENARIOPACKAGESIZE <= 0 and $TROPICALCYCLONE eq q{on} ) {
         assert_FATAL(
             sprintf qq{SCENARIOPACKAGESIZE must be defined and GREATER THAN 0, when TROPICALCYCLONE is 'on' in '%s'.},
@@ -605,12 +594,8 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
         );
     }
 
-    # get each case from SCENARIOS case/esac
     my $cases = $self->_extract_scenarios_from_config();
 
-    # do some basic inspection
-
-    # "*" (default) case is expected
     if ( not $cases->{q{*}} ) {
         assert_FATAL(
             sprintf qq{final default case "*)" not found in SCENARIOS section. Please adjust '%s' and try again.},
@@ -620,7 +605,6 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
 
   CASE_HINDCAST:
     {
-        # "-2" (hindcast) is expected
         if ( not $cases->{-2} ) {
             assert_FATAL(
                 sprintf qq{hindcast "-2)" not found in SCENARIOS section. Please adjust '%s' and try again.},
@@ -628,9 +612,8 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
             );
         }
 
-        # get full block present inside of the case statement
         my $CASE_hindcast_block = join qq{\n}, @{ $cases->{-2} };
-        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_hindcast_block );    # attempt to find value of ENSTORM
+        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_hindcast_block );
         if ( not $found_ENSTORM or $ENSTORM ne q{hindcast} ) {
             assert_FATAL(
                 sprintf qq{'ENSTORM=hindcast' not found in SCENARIOS section. Found '$ENSTORM' instead. Please adjust '%s' and try again.},
@@ -641,7 +624,6 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
 
   CASE_NOWCAST:
     {
-        # "-1" (nowcast) is expected
         if ( not $cases->{-1} ) {
             assert_FATAL(
                 sprintf qq{nowcast "-1)" not found in SCENARIOS section. Please adjust '%s' and try again.},
@@ -649,9 +631,8 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
             );
         }
 
-        # get full block present inside of the case statement
         my $CASE_nowcast_block = join qq{\n}, @{ $cases->{-1} };
-        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_nowcast_block );    # attempt to find value of ENSTORM
+        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_nowcast_block );
         if ( not $found_ENSTORM or $ENSTORM ne q{nowcast} ) {
             assert_FATAL(
                 sprintf qq{'ENSTORM=nowcast' not found in SCENARIOS section. Found '$ENSTORM' instead. Please adjust '%s' and try again.},
@@ -662,8 +643,7 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
 
   SCENARIO_COUNT:
     {
-        # looking at the number found
-        my $expected = $SCENARIOPACKAGESIZE + 1 + 2;                                                         # add in expected -1, -2, & '*'
+        my $expected = $SCENARIOPACKAGESIZE + 1 + 2;
         my $found    = keys %$cases;
 
         if ( $expected != $found ) {
@@ -676,10 +656,7 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
 
   SCENARIO_CHECK:
     {
-        # check for numbers in sequence (this matters, too)
         foreach my $i ( 0 .. $SCENARIOPACKAGESIZE - 1 ) {
-
-            # assert that cases appear in squence
             if ( not defined $cases->{$i} or not @{ $cases->{$i} } ) {
                 assert_FATAL(
                     sprintf qq{Can't find expected SCENARIO Case #$i. SCENARIOS cases must be indexed in order, start at 0. Please adjust '%s' and try again.},
@@ -687,15 +664,13 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
                 );
             }
 
-            # get full block present inside of the case statement
             my $CASE_block = join qq{\n}, @{ $cases->{$i} };
 
-            my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_block );    # attempt to find value of ENSTORM
-            my ( $found_PERCENT, $PERCENT ) = $self->_extract_from_string( q{PERCENT}, $CASE_block );    # attempt to find value of PERCENT
+            my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_block );
+            my ( $found_PERCENT, $PERCENT ) = $self->_extract_from_string( q{PERCENT}, $CASE_block );
 
-            # check for valid start patterns: 'nhcC', 'veerLeft', 'veerRight', 'namforecast', 'gfsforecast', 'vMax', 'rMax', 'nhcOfcl'
-	    my $_PERCENT = $PERCENT // q{};
-	    $_PERCENT =~ s/-//g;
+            my $_PERCENT = $PERCENT // q{};
+            $_PERCENT =~ s/-//g;
             if ( not $ENSTORM or $ENSTORM !~ m/^(nhcC|veerRight$_PERCENT|veerLeft$_PERCENT|namforecast|gfsforecast|vMax|rMax|nhcOfcl)/ ) {
                 assert_FATAL(
                     sprintf qq{Case "%s" - ENSTORM %s; typically starts with: 'nhcConsensus', 'veerRight$_PERCENT', 'veerLeft$_PERCENT', 'namforecast', 'gfsforecast', 'vMax', 'rMax', 'nhcOfcl'. Please adjust '%s' and try again.},
@@ -703,33 +678,27 @@ sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
                 );
             }
 
-            # check PERCENT on Left  (negative)
             if ( $ENSTORM =~ m/Left/ and $PERCENT > 0 ) {
                 assert_FATAL(
                     sprintf qq{Case "%s" - PERCENT must be a negative integer for 'veerLeft'. Please adjust '%s' and try again.},
                     $i, $ASGS_CONFIG
                 );
             }
-
-            # check PERCENT on Right (positive)
             elsif ( $ENSTORM =~ m/Right/ and $PERCENT < 0 ) {
                 assert_FATAL(
                     sprintf qq{Case "%s" - PERCENT must be a positive integer for 'veerRight'. Please adjust '%s' and try again.},
                     $i, $ASGS_CONFIG
                 );
             }
-
         }
     }
 
     return 1;
 }
 
-#  if necessary
 sub _extract_mesh_info {
     my ( $self, $cases, $file ) = @_;
 
-    # return without fuss to make it easier to handle when $LOCAL_MESH_DEFAULTS doesn't exist 
     return $cases if not -e $file;
 
     local $/;
@@ -746,19 +715,17 @@ sub _extract_mesh_info {
         ++$START  if ( $line =~ m/^case/ );
         next LINE unless  $START > 0;
         if ( $line =~ m/^ *([0-9a-zA-Z"_|*-]+)\)/ ) {
-            my $case = $1;                   # get capture
-            $case =~ s/["']//g;              # remove quotes
-            @names = split / *\| */, $case;  # split cases that have multiple names
+            my $case = $1;
+            $case =~ s/["']//g;
+            @names = split / *\| */, $case;
             next LINE;
         }
         next LINE if not @names;
 
-        # add an entry for each name at the expense space
         foreach my $case (@names) {
           push @{ $cases->{$case} }, $line;
         }
 
-        # detect line 
         if ( $line =~ m/;;/ ) {
             @names = ();
         }
@@ -804,12 +771,10 @@ sub _extract_scenarios_from_config {
 sub fatal_bincheck_ADCIRC {
     my ( $self, $o ) = @_;
 
-    #hint: ADCIRCDIR and ADCIRC_BINS must be available in the environment.
     if ( not $ADCIRCDIR or not $ADCIRC_BINS ) {
         assert_FATAL(q{ADCIRCDIR and ADCIRC_BINS must be available in the environment.});
     }
 
-    #asgswidom: All binaries listed in ADCIRC_BINS must exist in ADCIRCDIR and be in PATH
     foreach my $bin ( split /\s+/, $ADCIRC_BINS ) {
         if ( not $self->_BIN_OK( $ADCIRCDIR, $bin ) ) {
             assert_FATAL( sprintf qq{$bin is not found, but is required to be available via PATH to continue.} );
@@ -819,7 +784,6 @@ sub fatal_bincheck_ADCIRC {
     return 1;
 }
 
-# run after fatal_bincheck_ADCIRC
 sub query_ADCIRC_version {
     $ADCIRC_VERSION = `adcirc -v`;
     return $ADCIRC_VERSION;
@@ -832,7 +796,6 @@ sub fatal_configcheck_WAVES_if_on {
     ( $var_found, my $WAVES ) = $self->_extract_from_config(q{WAVES});
     return EXIT_SUCCESS if ( $WAVES eq q{off} );
 
-    #hint: If WAVES=on and SWANDT is sent in config, it must be in the range, 300 to 1200
     ( $var_found, my $SWANDT ) = $self->_extract_from_config(q{SWANDT});
     if ( $SWANDT and not $self->_IS_IN_RANGE( q{SWANDT}, 300, 1200 ) ) {
         assert_FATAL(
@@ -841,30 +804,26 @@ sub fatal_configcheck_WAVES_if_on {
         );
     }
 
-    #hint: If WAVES=on and REINITIALIZESWAN is set in config, it must be either 'on' or 'off'
     ( $var_found, my $REINITIALIZESWAN ) = $self->_extract_from_config(q{REINITIALIZESWAN});
-    if ( not $self->_DEFINED( $o, q{REINITIALIZESWAN}, qw/yes no/ ) ) {
+    if ( !defined $REINITIALIZESWAN || $REINITIALIZESWAN !~ m/^(on|off)$/ ) {
         assert_FATAL(
-            sprintf qq{REINITIALIZESWAN must be defined if WAVES=on, must be 'yes' or 'no', in '%s'.},
+            sprintf qq{REINITIALIZESWAN must be defined if WAVES=on, and must be 'on' or 'off', in '%s'.},
             $ASGS_CONFIG
         );
     }
 
-    #hint: If WAVES=on, adcswan and padcswan executables must be available via ADCIRCDIR (exported to environment via ADCIRC config)
     if (   not $ADCIRCDIR
         or not $self->_BIN_OK( $ADCIRCDIR, q{adcswan} )
         or not $self->_BIN_OK( $ADCIRCDIR, q{padcswan} ) ) {
         assert_FATAL( sprintf qq{adcswan and padswan are required if WAVES=on, via ADCIRCDIR which should be preferably defined in the environment.} );
     }
 
-    #hint: If WAVES=on, unhcat.exe executables must be available via SWANDIR (exported to environment via ADCIRC config)
     if (   not $SWANDIR
         or not -x sprintf( q{%s/%s}, $SWANDIR, q{unhcat.exe} )
         or system(q{which unhcat.exe > /dev/null 2>&1}) != EXIT_SUCCESS ) {
         assert_FATAL( sprintf qq{unhcat.exe required if WAVES=on, via SWANDIR which should be preferably defined in the environment.} );
     }
 
-    #hint: If WAVES=on, swaninit.template and $SWANTEMPLATE files exist in input/meshes/common/swan under either $SCRIPTDIR
     ( $var_found, my $SWANTEMPLATE ) = $self->_extract_from_config(q{SWANTEMPLATE});
     if (
         $var_found
@@ -884,15 +843,13 @@ sub fatal_configcheck_get_atcf {
     ( $var_found, my $TRIGGER ) = $self->_extract_from_config(q{TRIGGER});
     ( $var_found, my $FTPSITE ) = $self->_extract_from_config(q{FTPSITE});
 
-    #hint: FTPSITE can't be 'filesystem' when TRIGGER=ftp
-    if ($FTPSITE and $TRIGGER and $FTPSITE eq q{filesystem} and $TRIGGER eq q{ftp}) { 
+    if ($FTPSITE and $TRIGGER and $FTPSITE eq q{filesystem} and $TRIGGER eq q{ftp}) {
       assert_FATAL( qq{'TRIGGER=ftp' is not compatible with 'FTPSITE=filesystem'.} );
     }
 
     return 1;
 }
 
-# extracts information out of the mesh_default's file based on GRIDNAME
 sub _get_grid_info {
   my ($self, $GRIDNAME) = @_;
 
@@ -906,17 +863,14 @@ sub _get_grid_info {
   return $block;
 }
 
-# expands in a string, a given SHELL variable name and it's value
 sub _expand_shell_var {
   my ($self, $string, $VAR, $value) = @_;
 
-  return $string if not $string; # don't process undefined things
+  return $string if not $string;
 
-  # expand SCRIPTDIR (limit case of variables available for expansion)
   $string =~ s/\$?{?$VAR}?/$value/;
-  return $string; 
+  return $string;
 }
-
 
 sub fatal_configcheck_GRIDNAME {
     my ( $self, $o ) = @_;
@@ -931,51 +885,41 @@ sub fatal_configcheck_GRIDNAME {
     return 1;
 }
 
-# VARFLUX checks are rather convoluted, so we may need to break this up
 sub fatal_configcheck_VARFLUX {
     my ( $self, $o ) = @_;
 
-    # get GRIDNAME
     my ( $var_found, $GRIDNAME)   = $self->_extract_from_config(q{GRIDNAME});
-
-    # get grid info
     my $mesh_info                 = $self->_get_grid_info($GRIDNAME);
 
-    # get VARFLUX
     ( $var_found, my $VARFLUX)    = $self->_extract_from_config(q{VARFLUX});
 
-    # get following from mesh_defaults only (may need to put a check in later if every placed in config file)
     ( $var_found, my $INPUTDIR)           = $self->_extract_from_string(q{INPUTDIR}, $mesh_info);
     ( $var_found, my $RIVERFLUX)          = $self->_extract_from_string(q{RIVERFLUX}, $mesh_info);
     ( $var_found, my $RIVERINIT)          = $self->_extract_from_string(q{RIVERINIT}, $mesh_info);
     ( $var_found, my $HINDCASTRIVERFLUX)  = $self->_extract_from_string(q{HINDCASTRIVERFLUX}, $mesh_info);
 
-    # expand SCRIPTDIR (limit case of variables available for expansion)
     $INPUTDIR = $self->_expand_shell_var($INPUTDIR, q{SCRIPTDIR}, $SCRIPTDIR);
 
-    #hint: if VARFLUX is 'on' or 'default' & ADCIRC version is < v53, $INPUTDIR/$RIVERINIT must exist and not be empty 
-    if ( $VARFLUX and ( grep {/$VARFLUX/} qw/on default/) and $RIVERINIT and $RIVERINIT ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERINIT; 
-      $ADCIRC_VERSION =~ m/v(\d+)/; # attempt to extract number after "v", e.g., "v52" or "v53"
-      my $adcv = $1 // 1_000_000;   # if no capture, set to high value
-      if ( $adcv < 53 and not -e $file or not -s $file) { # note: -s is the file test flag for size
-        assert_FATAL( q{When VARFLUX=on or default, A& ADCIRC version < v53, ${INPUTDIR}/${RIVERINIT} must exist and not be empty.});
+    if ( $VARFLUX and ( grep { /$VARFLUX/ } qw/on default/ ) and $RIVERINIT and $RIVERINIT ne q{null} ) {
+      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERINIT;
+      $ADCIRC_VERSION =~ m/v(\d+)/;
+      my $adcv = $1 // 1_000_000;
+      if ( $adcv < 53 && ( !-e $file || !-s $file ) ) {
+        assert_FATAL( q{When VARFLUX=on or default, and ADCIRC version < v53, ${INPUTDIR}/${RIVERINIT} must exist and not be empty.});
       }
     }
 
-    #hint: if VARFLUX=default then $INPUTDIR/$RIVERFLUX must exist and not be empty 
-    if ( $VARFLUX and $VARFLUX eq q{defined} and $RIVERFLUX and $RIVERFLUX ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERFLUX; 
-      if ( not -e $file or not -s $file) { # note: -s is the file test flag for size
+    if ( $VARFLUX and $VARFLUX eq q{default} and $RIVERFLUX and $RIVERFLUX ne q{null} ) {
+      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERFLUX;
+      if ( !-e $file || !-s $file ) {
         assert_FATAL( q{When VARFLUX=default, ${INPUTDIR}/${RIVERFLUX} must exist and not be empty.});
       }
     }
 
-    #hint: if VARFLUX=on or VARFLUX=default for any ADCIRC version, $INPUTDIR/$HINDCASTRIVERFLUX must exist and not be empty 
-    if ( $VARFLUX and ( grep {/$VARFLUX/} qw/on default/) and $HINDCASTRIVERFLUX and $HINDCASTRIVERFLUX ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $HINDCASTRIVERFLUX; 
-      if ( not -e $file or not -s $file) { # note: -s is the file test flag for size
-        assert_FATAL( q{When VARFLUX=on or default, A& ADCIRC version < v53, ${INPUTDIR}/${HINDCASTRIVERFLUX} must exist and not be empty.});
+    if ( $VARFLUX and ( grep { /$VARFLUX/ } qw/on default/ ) and $HINDCASTRIVERFLUX and $HINDCASTRIVERFLUX ne q{null} ) {
+      my $file = sprintf qq{%s/%s}, $INPUTDIR, $HINDCASTRIVERFLUX;
+      if ( !-e $file || !-s $file ) {
+        assert_FATAL( q{When VARFLUX=on or default, ${INPUTDIR}/${HINDCASTRIVERFLUX} must exist and not be empty.});
       }
     }
 
@@ -986,14 +930,11 @@ sub fatal_configcheck_VARFLUX {
 # V A L I D A T I O N  R O U T I N E S
 #
 
-# "no op", just used in variable config for clarity
 sub _DEFER_CHECK {
     my ( $self, $o, $var ) = @_;
     return 1;
 }
 
-# does -x check on full path to binary + checks it's
-# in path using system's `which`
 sub _BIN_OK {
     my ( $self, $base_path, $bin_name ) = @_;
     if ( not -x sprintf( q{%s/%s}, $base_path, $bin_name )
@@ -1003,8 +944,6 @@ sub _BIN_OK {
     return 1;
 }
 
-# tests to see if variable exists in config and is a member of a set
-# of values
 sub _IN {
     my ( $self, $o, $var, @valid_list ) = @_;
     my $var_found;
@@ -1015,7 +954,6 @@ sub _IN {
     return 1;
 }
 
-# tests to see if variable is an integer
 sub _INT {
     my ( $self, $o, $var ) = @_;
     my $var_found;
@@ -1029,7 +967,6 @@ sub _INT {
     return 1;
 }
 
-# tests to see if variable is == 1
 sub _IS_ONE {
     my ( $self, $o, $var ) = @_;
     my $var_found;
@@ -1043,7 +980,6 @@ sub _IS_ONE {
     return 1;
 }
 
-# tests to see if variable is in a range, inclusive
 sub _IS_IN_RANGE {
     my ( $self, $o, $var, $min, $max ) = @_;
     my $var_found;
@@ -1057,31 +993,24 @@ sub _IS_IN_RANGE {
     return 1;
 }
 
-# TRUE if "$var=" is found in ASGS_CONFIG or if the
-# $ENV{$var} hash key exists (but is not necessarily defined)
-# because in both cases, it is available for asgs_main.sh and all child
-# processes to use
 sub _exists {
     my ( $self, $var ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( $CFG_VALUE or $ENV{$var} ) {
-        return 1;
-    }
+    my ($var_found, undef) = $self->_extract_from_config_no_ENV($var);
+
+    return 1 if $var_found;
+    return 1 if exists $ENV{$var};
+
     return undef;
 }
 
-# true if the variable _exists_ and is also defined
 sub _DEFINED {
     my ( $self, $o, $var ) = @_;
 
-    # $var existing is a necessary condition
     return undef if not $self->_exists($var);
 
-    # now check if it's actually defined (i.e., not undef)
     my ( $var_found, $CFG_VALUE ) = $self->_extract_from_config($var);
 
-    # diagnotic output when -v is set
+    # diagnostic output when -v is set
     printf STDERR qq{(INFO: _DEFINED sub): %-20s is "%s" \n}, $var, $CFG_VALUE // q{undefined} if $o->v;
 
     if ( not $var_found or not defined $CFG_VALUE ) {
@@ -1090,10 +1019,8 @@ sub _DEFINED {
     return 1;
 }
 
-# tests to see if directory exists
-
 sub _DIR_EXISTS {
-    my ( $self, $o, $var, $subdir ) = @_; 
+    my ( $self, $o, $var, $subdir ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
     my $file = ($subdir) ? qq{$subdir/$CFG_VALUE} : qq{$CFG_VALUE};
@@ -1104,7 +1031,7 @@ sub _DIR_EXISTS {
 }
 
 sub _FILE_EXISTS {
-    my ( $self, $o, $var, $subdir ) = @_; 
+    my ( $self, $o, $var, $subdir ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
     my $file = ($subdir) ? qq{$subdir/$CFG_VALUE} : qq{$CFG_VALUE};
@@ -1115,7 +1042,7 @@ sub _FILE_EXISTS {
 }
 
 sub _IS_ABSOLUTE_PATH {
-    my ( $self, $o, $var ) = @_; 
+    my ( $self, $o, $var ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
     if ( $CFG_VALUE !~ m{^/} ) {
@@ -1125,16 +1052,16 @@ sub _IS_ABSOLUTE_PATH {
 }
 
 sub _LOOKS_LIKE_REMOTE_HOST {
-    my ( $self, $o, $var ) = @_; 
+    my ( $self, $o, $var ) = @_;
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
 
-    # fails if $CFG_VALUE is not a valid hostname or IPv4 IP address
-    if ( not $CFG_VALUE =~ m/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/
-         and not $CFG_VALUE =~ m/^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/) {
-      return undef;
-    }
-    return 1;
+    return undef if !defined $CFG_VALUE || $CFG_VALUE eq q{};
+
+    my $is_ipv4 = $CFG_VALUE =~ m/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/;
+    my $is_host = $CFG_VALUE =~ m/^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/;
+
+    return ( $is_ipv4 || $is_host ) ? 1 : undef;
 }
 
 sub _LOOKS_LIKE_EMAIL_ADDRESS {
@@ -1143,20 +1070,18 @@ sub _LOOKS_LIKE_EMAIL_ADDRESS {
     my $var_found;
     ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
 
-    # must exist
     return undef unless defined $CFG_VALUE and length $CFG_VALUE;
 
-    # basic email validation
     if (
         not $CFG_VALUE =~ m{
             ^
-            [A-Za-z0-9._%+\-]+            # local part
+            [A-Za-z0-9._%+\-]+
             \@
-            (?:[A-Za-z0-9]                # domain labels
+            (?:[A-Za-z0-9]
                (?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?
                \.
             )+
-            [A-Za-z]{2,}                  # TLD
+            [A-Za-z]{2,}
             $
         }x
     ) {
@@ -1169,17 +1094,6 @@ sub _LOOKS_LIKE_EMAIL_ADDRESS {
 # U T I L I T Y  R O U T I N E S
 #
 
-# returns a list; first variable is if the $var exists in $ASGS_CONFIG; the
-# second is the value of the assignment (undef if anything is on the RHS of
-# the '='
-# Handles:
-#   FOO=bar
-#   export FOO=bar
-#   FOO="bar baz"
-#   FOO='bar baz'
-#   FOO=
-#   POSTPROCESS=( includeWind10m.sh createOPeNDAPFileList.sh $OPENDAPPOST )
-#   POSTPROCESS=("a b" c '$D')
 sub _extract_from_string {
     my ( $self, $varname, $text ) = @_;
 
@@ -1188,23 +1102,23 @@ sub _extract_from_string {
     if (
         $text =~ m{
             ^\s*
-            (?:export\s+)?                  # optional export
-            ($re_var)                       # variable name
+            (?:export\s+)?
+            ($re_var)
             \s*=\s*
             (?:
-                "((?:\\.|[^"])*)"           # double-quoted value
-              | '([^']*)'                   # single-quoted value
+                "((?:\\.|[^"])*)"
+              | '([^']*)'
               | (\(
                     (?:
-                        [^()"'\\]           # ordinary chars
-                      | \\ .                # backslash escape
-                      | " (?:\\.|[^"])* "   # quoted chunk inside array
-                      | ' [^']* '           # single-quoted chunk inside array
+                        [^()"'\\]
+                      | \\ .
+                      | " (?:\\.|[^"])* "
+                      | ' [^']* '
                     )*
-                 \))                        # bash-style single-line array/list
-              | ([^[:space:]#;]*)           # unquoted scalar (possibly empty)
+                 \))
+              | ([^[:space:]#;]*)
             )
-            \s*(?:\#.*)?                    # optional trailing comment
+            \s*(?:\#.*)?
             $
         }mx
     ) {
@@ -1262,7 +1176,6 @@ sub _extract_from_config {
 sub _extract_from_statefile {
     my ( $self, $varname ) = @_;
 
-    # short circuit if not yet defined (will be the case for brand new profiles)
     return undef if not $STATEFILE;
 
     local $/;
@@ -1286,7 +1199,7 @@ asgs-lint ($VERSION) ... A very strict, static ASGS configuration file checker.
 Quick Start - no options are required if ASGS_CONFIG is set:
 
   1. ./asgsh
-  2. load profile # (select profile) 
+  2. load profile # (select profile)
   3. asgs-lint    # command is available via PATH
   4. if asgs-lint finds an issue with the config it'll exit;
      fix the issue and rerun until there are no more issues
