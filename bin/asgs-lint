@@ -77,7 +77,7 @@ my $assert_checks = {
 #    VORTEXMODEL parameter must be set to something other than GAHM when BACKGROUNDMET set to namBlend, gfsBlend, or rrfsBlend.
 #    if VARFLUX=on or VARFLUX=default for any ADCIRC version,
 #    if WAVES=on and SWANDT is sent in config, it must be in the range, 300 to 1200
-#    if WAVES=on and REINITIALIZESWAN is set in config, it must be either 'on' or 'off'
+#    if WAVES=on and REINITIALIZESWAN is set in config, it must be either 'yes' or 'no'
 #    if WAVES=on, adcswan and padcswan executables must be available via ADCIRCDIR (exported to environment via ADCIRC config)
 #    if WAVES=on, unhcat.exe executables must be available via SWANDIR (exported to environment via ADCIRC config)
 #    if WAVES=on, swaninit.template and $SWANTEMPLATE files exist in input/meshes/common/swan under either $SCRIPTDIR
@@ -299,7 +299,7 @@ my $CONFIG_VARS =  d2o {
         ord   => 135,
         req   => 0,
         check => [ \&_DEFER_CHECK ],
-        hint  => q{If defined and WAVES=on, must be: 'on' or 'off'.},
+        hint  => q{If defined and WAVES=on, must be: 'yes' or 'no'.},
     },
     SWANTEMPLATE => {
         ord   => 140,
@@ -805,9 +805,9 @@ sub fatal_configcheck_WAVES_if_on {
     }
 
     ( $var_found, my $REINITIALIZESWAN ) = $self->_extract_from_config(q{REINITIALIZESWAN});
-    if ( !defined $REINITIALIZESWAN || $REINITIALIZESWAN !~ m/^(on|off)$/ ) {
+    if ( !defined $REINITIALIZESWAN || $REINITIALIZESWAN !~ m/^(yes|no)$/ ) {
         assert_FATAL(
-            sprintf qq{REINITIALIZESWAN must be defined if WAVES=on, and must be 'on' or 'off', in '%s'.},
+            sprintf qq{REINITIALIZESWAN must be defined if WAVES=on, and must be 'yes' or 'no', in '%s'.},
             $ASGS_CONFIG
         );
     }
