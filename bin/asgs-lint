@@ -50,7 +50,6 @@ my $assert_checks = {
     fatal_configcheck_CPUs                                           => 15,    # sanity check on requested CPUs
     fatal_configcheck_HOTORCOLD                                      => 20,    # sanity check for configured hotstarts, inspects STATEFILE if exists
     fatal_configcheck_VORTEXMODEL_if_DEFINED                         => 25,    # ensures VORTEXMODEL setting, if defined in config, is consistent with BACKGROUNDMET
-    fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED => 30,    # sanity check for scenario package definition, so op doesn't mismatch SCENARIOPACKAGESIZE
     fatal_bincheck_ADCIRC                                            => 35,    # ensures ADCIRC bins are available via PATH
     query_ADCIRC_version                                             => 37,    # sets ADCIRC version, making it available globally
     fatal_configcheck_WAVES_if_on                                    => 40,    # ensures SWAN bins are in PATH no-op if WAVES=off
@@ -82,7 +81,6 @@ my $assert_checks = {
 #    if WAVES=on, unhcat.exe executables must be available via SWANDIR (exported to environment via ADCIRC config)
 #    if WAVES=on, swaninit.template and $SWANTEMPLATE files exist in input/meshes/common/swan under either $SCRIPTDIR
 #    ADCIRC ENV checks
-#    if TROPICALCYCLONE=on, SCENARIOPACKAGESIZE is checked and some sanity checks on the case/esac structure are done
 #    RIVERDATAPROTOCOL is set to one of scp, ftp, or filesystem
 #    FTPSITE=filesystem and TRIGGER=ftp is a fatal warning
 #    ARCHIVE if defined, must be a file that exists in $SCRIPTDIR/archive
@@ -264,12 +262,6 @@ my $CONFIG_VARS =  d2o {
         req   => 1,
         check => [ \&_DEFER_CHECK ],
         hint  => q{Used when HOTORCOLD is 'hotstart'.},
-    },
-    SCENARIOPACKAGESIZE => {
-        ord   => 115,
-        req   => 0,
-        check => [ sub { \&_DEFER_CHECK } ],
-        hint  => q{specifies number of storms scenarios to be running in addition to a hindcast and a nowcast},
     },
     QUALITYSETTING => {
         ord   => 117,
@@ -573,124 +565,6 @@ sub fatal_configcheck_VORTEXMODEL_if_DEFINED {
             sprintf qq{VORTEXMODEL can't be 'GAHM' when BACKGROUNDMET is 'namBlend', 'gfsBlend', or 'rrfsBlend' in '%s'.},
             $ASGS_CONFIG
         );
-    }
-
-    return 1;
-}
-
-# Note: will only check if $SCENARIOPACKAGESIZE is defined and $TROPICALCYCLONE=YES
-sub fatal_configcheck_SCENARIOPACKAGESIZE_if_TROPICALCYCLONE_DEFINED {
-    my ( $self, $o ) = @_;
-
-    my ( $var_found, $TROPICALCYCLONE ) = $self->_extract_from_config(q{TROPICALCYCLONE});
-    ( $var_found, my $SCENARIOPACKAGESIZE ) = $self->_extract_from_config(q{SCENARIOPACKAGESIZE});
-
-    return EXIT_SUCCESS if not $TROPICALCYCLONE;
-
-    if ( $SCENARIOPACKAGESIZE <= 0 and $TROPICALCYCLONE eq q{on} ) {
-        assert_FATAL(
-            sprintf qq{SCENARIOPACKAGESIZE must be defined and GREATER THAN 0, when TROPICALCYCLONE is 'on' in '%s'.},
-            $ASGS_CONFIG
-        );
-    }
-
-    my $cases = $self->_extract_scenarios_from_config();
-
-    if ( not $cases->{q{*}} ) {
-        assert_FATAL(
-            sprintf qq{final default case "*)" not found in SCENARIOS section. Please adjust '%s' and try again.},
-            $ASGS_CONFIG
-        );
-    }
-
-  CASE_HINDCAST:
-    {
-        if ( not $cases->{-2} ) {
-            assert_FATAL(
-                sprintf qq{hindcast "-2)" not found in SCENARIOS section. Please adjust '%s' and try again.},
-                $ASGS_CONFIG
-            );
-        }
-
-        my $CASE_hindcast_block = join qq{\n}, @{ $cases->{-2} };
-        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_hindcast_block );
-        if ( not $found_ENSTORM or $ENSTORM ne q{hindcast} ) {
-            assert_FATAL(
-                sprintf qq{'ENSTORM=hindcast' not found in SCENARIOS section. Found '$ENSTORM' instead. Please adjust '%s' and try again.},
-                $ASGS_CONFIG
-            );
-        }
-    }
-
-  CASE_NOWCAST:
-    {
-        if ( not $cases->{-1} ) {
-            assert_FATAL(
-                sprintf qq{nowcast "-1)" not found in SCENARIOS section. Please adjust '%s' and try again.},
-                $ASGS_CONFIG
-            );
-        }
-
-        my $CASE_nowcast_block = join qq{\n}, @{ $cases->{-1} };
-        my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_nowcast_block );
-        if ( not $found_ENSTORM or $ENSTORM ne q{nowcast} ) {
-            assert_FATAL(
-                sprintf qq{'ENSTORM=nowcast' not found in SCENARIOS section. Found '$ENSTORM' instead. Please adjust '%s' and try again.},
-                $ASGS_CONFIG
-            );
-        }
-    }
-
-  SCENARIO_COUNT:
-    {
-        my $expected = $SCENARIOPACKAGESIZE + 1 + 2;
-        my $found    = keys %$cases;
-
-        if ( $expected != $found ) {
-            assert_FATAL(
-                sprintf qq{SCENARIOPACKAGESIZE is set to %d and is probably wrong. Found %d distinct cases, was expecting %d by this count. Also check case numbering for duplicates. Please adjust '%s' and try again.},
-                $SCENARIOPACKAGESIZE, $found, $expected, $ASGS_CONFIG
-            );
-        }
-    }
-
-  SCENARIO_CHECK:
-    {
-        foreach my $i ( 0 .. $SCENARIOPACKAGESIZE - 1 ) {
-            if ( not defined $cases->{$i} or not @{ $cases->{$i} } ) {
-                assert_FATAL(
-                    sprintf qq{Can't find expected SCENARIO Case #$i. SCENARIOS cases must be indexed in order, start at 0. Please adjust '%s' and try again.},
-                    $ASGS_CONFIG
-                );
-            }
-
-            my $CASE_block = join qq{\n}, @{ $cases->{$i} };
-
-            my ( $found_ENSTORM, $ENSTORM ) = $self->_extract_from_string( q{ENSTORM}, $CASE_block );
-            my ( $found_PERCENT, $PERCENT ) = $self->_extract_from_string( q{PERCENT}, $CASE_block );
-
-            my $_PERCENT = $PERCENT // q{};
-            $_PERCENT =~ s/-//g;
-            if ( not $ENSTORM or $ENSTORM !~ m/^(nhcC|veerRight$_PERCENT|veerLeft$_PERCENT|namforecast|gfsforecast|vMax|rMax|nhcOfcl)/ ) {
-                assert_FATAL(
-                    sprintf qq{Case "%s" - ENSTORM %s; typically starts with: 'nhcConsensus', 'veerRight$_PERCENT', 'veerLeft$_PERCENT', 'namforecast', 'gfsforecast', 'vMax', 'rMax', 'nhcOfcl'. Please adjust '%s' and try again.},
-                    $i, ( not $found_ENSTORM ) ? q{is MISSING} : qq{'$ENSTORM' appears INVALID}, $ASGS_CONFIG
-                );
-            }
-
-            if ( $ENSTORM =~ m/Left/ and $PERCENT > 0 ) {
-                assert_FATAL(
-                    sprintf qq{Case "%s" - PERCENT must be a negative integer for 'veerLeft'. Please adjust '%s' and try again.},
-                    $i, $ASGS_CONFIG
-                );
-            }
-            elsif ( $ENSTORM =~ m/Right/ and $PERCENT < 0 ) {
-                assert_FATAL(
-                    sprintf qq{Case "%s" - PERCENT must be a positive integer for 'veerRight'. Please adjust '%s' and try again.},
-                    $i, $ASGS_CONFIG
-                );
-            }
-        }
     }
 
     return 1;
