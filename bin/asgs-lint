@@ -90,7 +90,7 @@ my $assert_checks = {
 #    if VARFLUX=on or VARFLUX=default for any ADCIRC version, verify that the file $INPUTDIR/$HINDCASTRIVERFLUX exists and has nonzero length
 #    if enablePostStatus is set, it must be "yes" or "no"
 #    if enableStatusNotify is set, it must be "yes" or "no"
-#    if statusNotify is set, it must be "no" or look like an email address
+#    if statusNotify is set, it must be "null" or look like an email address
 #    EMAILNOTIFY defaults to "no", but if set must be "yes" or "no"
 #
 #TODO - COMPLEX BUT VERY POSSIBLE
@@ -325,7 +325,7 @@ my $CONFIG_VARS =  d2o {
         ord   => 147,
         req   => 0,
         check => [ sub { _CHECK_statusNotify(@_) } ],
-        hint => q{statusNotify must be an email address or set to "no"},
+        hint => q{statusNotify must be an email address or set to "null"},
     },
     RIVERDATAPROTOCOL => {
         ord   => 150,
@@ -994,7 +994,7 @@ sub _CHECK_statusNotify {
 
     return undef unless defined $CFG_VALUE and length $CFG_VALUE;
 
-    return 1 if $CFG_VALUE =~ m/^no$/;
+    return 1 if $CFG_VALUE =~ m/^null$/;
 
     return 1 if _LOOKS_LIKE_EMAIL_ADDRESS(@_); 
 
