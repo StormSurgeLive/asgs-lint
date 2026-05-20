@@ -88,6 +88,10 @@ my $assert_checks = {
 #    if VARFLUX=default then verify that the file $INPUTDIR/$RIVERFLUX exists and has nonzero length
 #    if VARFLUX=on or VARFLUX=default and the ADCIRC version is less than v53, then verify that the file $INPUTDIR/$RIVERINIT exists and has nonzero length
 #    if VARFLUX=on or VARFLUX=default for any ADCIRC version, verify that the file $INPUTDIR/$HINDCASTRIVERFLUX exists and has nonzero length
+#    if enablePostStatus is set, it must be "yes" or "no"
+#    if enableStatusNotify is set, it must be "yes" or "no"
+#    if statusNotify is set, it must be "no" or look like an email address
+#    EMAILNOTIFY defaults to "no", but if set must be "yes" or "no"
 #
 #TODO - COMPLEX BUT VERY POSSIBLE
 #    ??? if VARFLUX=on and USERIVERFILEONLY=no then verify that
@@ -301,9 +305,27 @@ my $CONFIG_VARS =  d2o {
     },
     EMAILNOTIFY => {
         ord   => 145,
-        req   => 1,
+        req   => 0,
         check => [ sub { _IN( @_, qw/yes no/ ) } ],
-        hint  => q{must be: 'yes' or 'no'; important for reliably controlling emails sent by POSTPROCESS hook scripts.},
+        hint  => q{EMAILNOTIFY must be: 'yes' or 'no'; important for reliably controlling emails sent by POSTPROCESS hook scripts.},
+    },
+    enablePostStatus => {
+        ord   => 146,
+        req   => 0,
+        check => [ sub { _IN( @_, qw/yes no/ ) } ],
+        hint  => q{enablePostStatus,if set, must be: 'yes' or 'no'.},
+    },
+    enableStatusNotify => {
+        ord   => 146,
+        req   => 0,
+        check => [ sub { _IN( @_, qw/yes no/ ) } ],
+        hint  => q{enableStatusNotify,if set, must be: 'yes' or 'no'.},
+    },
+    statusNotify => {
+        ord   => 147,
+        req   => 0,
+        check => [ sub { _CHECK_statusNotify(@_) } ],
+        hint => q{statusNotify must be an email address or set to "no"},
     },
     RIVERDATAPROTOCOL => {
         ord   => 150,
@@ -962,6 +984,21 @@ sub _LOOKS_LIKE_EMAIL_ADDRESS {
         return undef;
     }
     return 1;
+}
+
+sub _CHECK_statusNotify {
+    my ( $self, $o, $var ) = @_;
+
+    my $var_found;
+    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
+
+    return undef unless defined $CFG_VALUE and length $CFG_VALUE;
+
+    return 1 if $CFG_VALUE =~ m/^no$/;
+
+    return 1 if _LOOKS_LIKE_EMAIL_ADDRESS(@_); 
+
+    return undef;
 }
 
 #
