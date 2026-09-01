@@ -7,1193 +7,1069 @@ use v5.12;
 package bin::asgslint;
 
 use Cwd qw/abs_path/;
-use Util::H2O::More qw/d2o h2o Getopt2h2o ddd/;
+use File::Basename qw/dirname/;
+use File::Spec ();
 use Encode ();
+use Util::H2O::More qw/d2o h2o Getopt2h2o/;
 
-our $VERSION = q{1.0.0};
+our $VERSION = q{1.1.3};
 
 use constant {
     EXIT_SUCCESS => 0,
     EXIT_ERROR   => 255,
 };
 
-my $ERRORS = [];                      # accumulate errors so we fail after detecting all errors
+my $FINDINGS = [];
+my $ADCIRC_VERSION;
 
-# Expected variables in %ENV
-my $SCRIPTDIR           = $ENV{SCRIPTDIR};
-my $ASGS_CONFIG         = $ENV{ASGS_CONFIG};
-my $ADCIRCDIR           = $ENV{ADCIRCDIR};
-my $ADCIRC_BINS         = $ENV{ADCIRC_BINS};
-my $STATEFILE           = $ENV{STATEFILE};
-my $SWANDIR             = $ENV{SWANDIR};
-my $MESH_DEFAULTS       = $ENV{ASGS_MESH_DEFAULTS};
-my $LOCAL_MESH_DEFAULTS = ($ENV{ASGS_LOCAL_DIR}) ? sprintf(qq{%s/config/mesh_defaults.sh}, $ENV{ASGS_LOCAL_DIR}) : int rand 1_000_000; # security hedge if ASGS_LOCAL_DIR is not defined
+my @PLATFORM_VARS = qw/
+    HPCENV HPCENVSHORT QUEUESYS QCHECKCMD QSUMMARYCMD SUBMITSTRING
+    QUEUENAME SERQUEUE SERQUEUE_NTASKS ACCOUNT QSCRIPTTEMPLATE JOBLAUNCHER
+    PPN ARCHIVE ARCHIVEBASE OPENDAPPOST TDS MAKEJOBS QUOTACHECKCMD ALLOCCHECKCMD
+/;
 
-# Globals set later
-my $ADCIRC_VERSION      = undef;
-
-# C H E C K  S C H E D U L E R
-#
-#--
-#   these checks are names of actual subroutines that are called IN ORDER and the script dies
-#   when the *first* FATAL condition is detected; if a subroutine is not defined, then you will
-#   get a runtime error; this is something that typically only an ASGS developer will see when
-#   updating this linter script
-
-my $assert_checks = {
-    fatal_filecheck_ASGS_CONFIG                                      => 1,     # ensures $ASGS_CONFIG exists
-    fatal_encodingcheck_ASGS_CONFIG                                  => 2,     # ensures $ASGS_CONFIG doesn't contain Windows-specific endings
-    fatal_configcheck_asgsh_vars                                     => 3,     # fatal if any of these exist in config since
-    fatal_configcheck_GRIDNAME                                       => 5,     # fatal if GRIDNAME doesn't exist
-    maybe_fatal_configcheck_missing                                  => 8,     # checks $ASGS_CONFIG/ENV for required variables
-    fatal_configcheck_FORCINGS                                       => 10,    # sanity check on TROPICALCYCLONE / BACKGROUNDMET
-    fatal_configcheck_CPUs                                           => 15,    # sanity check on requested CPUs
-    fatal_configcheck_HOTORCOLD                                      => 20,    # sanity check for configured hotstarts, inspects STATEFILE if exists
-    fatal_configcheck_VORTEXMODEL_if_DEFINED                         => 25,    # ensures VORTEXMODEL setting, if defined in config, is consistent with BACKGROUNDMET
-    fatal_bincheck_ADCIRC                                            => 35,    # ensures ADCIRC bins are available via PATH
-    query_ADCIRC_version                                             => 37,    # sets ADCIRC version, making it available globally
-    fatal_configcheck_WAVES_if_on                                    => 40,    # ensures SWAN bins are in PATH no-op if WAVES=off
-    fatal_configcheck_get_atcf                                       => 45,    # ensures that TRIGGER and FTPSITE are compatible
-    fatal_configcheck_VARFLUX                                        => 50,    # check conditions surrounding river forcing parameter, VARFLUX
-};
-
-# N O T E S
-#
-#  *may be out of sync with the functional source code
-#--
-#    TRIGGER must be ftp, rss, rssembedded, or atcf.
-#    NCPUCAPACITY must be greater than or at least equal to NCPU plus NUMWRITERS for each individual scenario.
-#    BACKGROUNDMET must set to allowable values : on, NAM, OWI, namBlend, GFS, gfsBlend, RRFS, rrfsBlend, and off.
-#    BACKGROUNDMET parameter can only be set to off, namBlend, gfsBlend, or rrfsBlend when TROPICALCYCLONE is set to something other than off.
-#    TROPICALCYCLONE and BACKGROUNDMET cannot both be on simultaneously.
-#    TROPICALCYCLONE and BACKGROUNDMET cannot both be off simultaneously.
-#    LASTSUBDIR cannot be set to null in the config file if the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart), and the STATEFILE does not exist.
-#    LASTSUBDIR cannot be set to null in the STATEFILE file if it exists and the ASGS is trying to hotstart (i.e., HOTORCOLD=hotstart).
-#
-#Done, Optional, if defined
-#    QUEUESYS must be serial, mpiexec, SLURM, or PBS.
-#    VORTEXMODEL parameter must set to SYMMETRIC, ASYMMETRIC, and GAHM.
-#    VORTEXMODEL parameter must be set to something other than GAHM when BACKGROUNDMET set to namBlend, gfsBlend, or rrfsBlend.
-#    if VARFLUX=on or VARFLUX=default for any ADCIRC version,
-#    if WAVES=on and SWANDT is sent in config, it must be in the range, 300 to 1200
-#    if WAVES=on and REINITIALIZESWAN is set in config, it must be either 'yes' or 'no'
-#    if WAVES=on, adcswan and padcswan executables must be available via ADCIRCDIR (exported to environment via ADCIRC config)
-#    if WAVES=on, unhcat.exe executables must be available via SWANDIR (exported to environment via ADCIRC config)
-#    if WAVES=on, swaninit.template and $SWANTEMPLATE files exist in input/meshes/common/swan under either $SCRIPTDIR
-#    ADCIRC ENV checks
-#    RIVERDATAPROTOCOL is set to one of scp, ftp, or filesystem
-#    FTPSITE=filesystem and TRIGGER=ftp is a fatal warning
-#    ARCHIVE if defined, must be a file that exists in $SCRIPTDIR/archive
-#    ARCHIVEBASE if defined, must be an absolute path (but doesn't have to exist)
-#    if VARFLUX=default then verify that the file $INPUTDIR/$RIVERFLUX exists and has nonzero length
-#    if VARFLUX=on or VARFLUX=default and the ADCIRC version is less than v53, then verify that the file $INPUTDIR/$RIVERINIT exists and has nonzero length
-#    if VARFLUX=on or VARFLUX=default for any ADCIRC version, verify that the file $INPUTDIR/$HINDCASTRIVERFLUX exists and has nonzero length
-#    if enablePostStatus is set, it must be "yes" or "no"
-#    if enableStatusNotify is set, it must be "yes" or "no"
-#    if statusNotify is set, it must be "null" or look like an email address
-#    EMAILNOTIFY defaults to "no", but if set must be "yes" or "no"
-#
-#TODO - COMPLEX BUT VERY POSSIBLE
-#    ??? if VARFLUX=on and USERIVERFILEONLY=no then verify that
-#    if RIVERDATAPROTOCOL=scp then verify that the ssh server $RIVERSITE is reachable as the user $RIVERUSER and that the directory $RIVERDIR exists and is readable
-#--
-
-my $CONFIG_VARS =  d2o {
-    INSTANCENAME => {
-        ord   => 1,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Must be defined, no spaces},
+my $RULES = d2o {
+    config_file => {
+        ord => 1, severity => q{error}, category => q{config},
+        summary => q{ASGS_CONFIG must exist, be readable UTF-8 text, and use Unix line endings.},
     },
-    ACCOUNT => {
-        ord   => 1,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Must be defined, no spaces},
+    disallowed_config_vars => {
+        ord => 2, severity => q{error}, category => q{config},
+        summary => q{Environment-owned ASGS variables must not be assigned in ASGS_CONFIG.},
     },
-    ASGSADMIN => {
-        ord   => 5,
-        req   => 1,
-        check => [ sub { _LOOKS_LIKE_EMAIL_ADDRESS(@_) } ],
-        hint => q{ASGSADMIN must be an email address},
+    required_vars => {
+        ord => 3, severity => q{error}, category => q{config},
+        summary => q{Required ASGS configuration values must be available from config or environment.},
     },
-    PPN       => {
-        ord   => 10,
-        req   => 1,
-        check => [ \&_INT ],
-        hint  => q{Must be integer greater than 0},
+    instance_name => {
+        ord => 4, severity => q{warning}, category => q{config},
+        summary => q{INSTANCENAME may be omitted or set to auto; when possible the ASGS-derived instance name is reproduced statically.},
     },
-    NCPU => {
-        ord   => 15,
-        req   => 1,
-        check => [ \&_INT ],
-        hint  => q{Must be integer greater than 0},
+    mesh_defaults_order => {
+        ord => 5, severity => q{error}, category => q{config},
+        summary => q{GRIDNAME and explicit parameterPackage settings must precede the config/mesh_defaults.sh source that consumes them.},
     },
-    NUMWRITERS => {
-        ord   => 20,
-        req   => 1,
-        check => [ \&_IS_ONE ],
-        hint  => q{Must be integer greater than 0 (1 is recommended)},
+    forcing => {
+        ord => 10, severity => q{error}, category => q{forcing},
+        summary => q{BACKGROUNDMET and TROPICALCYCLONE must use supported, compatible values.},
     },
-    NCPUCAPACITY => {
-        ord   => 25,
-        req   => 1,
-        check => [ \&_INT ],
-        hint  => q{Must be integer greater than 0},
+    scenario_structure => {
+        ord => 20, severity => q{error}, category => q{scenario},
+        summary => q{The static case $si scenario package must have coherent hindcast, nowcast, forecast, and wildcard branches.},
     },
-    QUEUENAME => {
-        ord   => 30,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Name of the queue used for parallel compute jobs},
+    scenario_forcing => {
+        ord => 21, severity => q{error}, category => q{scenario},
+        summary => q{Forecast scenario names must be compatible with the selected forcing family when that can be proven statically.},
     },
-    SERQUEUE => {
-        ord   => 35,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Name of the queue used for single processor jobs},
+    wind10m => {
+        ord => 22, severity => q{error}, category => q{scenario},
+        summary => q{With createWind10mLayer=yes, SCENARIOPACKAGESIZE and explicit *Wind10m forecast scenarios are obsolete and must not be active.},
     },
-    SERQUEUE_NTASKS => {
-        ord   => 35,
-        req   => 1,
-        check => [ \&_INT ],
-        hint  => q{Number of tasks to request for serial processor jobs in order to satisfy memory requirements},
+    cpu_capacity => {
+        ord => 30, severity => q{error}, category => q{compute},
+        summary => q{NCPU + NUMWRITERS must not exceed NCPUCAPACITY.},
     },
-    GRIDNAME => {
-        ord   => 40,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{name of grid to use},
+    serqueue_ntasks => {
+        ord => 31, severity => q{error}, category => q{compute},
+        summary => q{SERQUEUE_NTASKS is optional; if set, it must be an integer from 1 through effective PPN.},
     },
-    BACKGROUNDMET => {
-        ord   => 45,
-        req   => 1,
-        check => [ sub { _IN( @_, qw/on off NAM OWI namBlend GFS gfsBlend RRFS rrfsBlend/ ) } ],
-        hint  => q{Must be: 'on', 'off', 'NAM', 'OWI', 'namBlend', 'GFS', 'gfsBlend', 'RRFS', or 'rrfsBlend'},
+    platform_definition => {
+        ord => 40, severity => q{error}, category => q{platform},
+        summary => q{PLATFORM_INIT or legacy ASGS_PLATFORMS is inspected statically; referenced platform files must exist and be readable.},
     },
-    TROPICALCYCLONE => {
-        ord   => 50,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Turn tropical cyclone forcing 'on' or 'off'},
+    platform_provenance => {
+        ord => 41, severity => q{warning}, category => q{platform},
+        summary => q{Differences among platform, current environment, and explicit config values are reported without sourcing shell code.},
     },
-    TRIGGER => {
-        ord   => 55,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/ftp rss rssembedded atcf/ ) } ],
-        hint  => q{Must be: 'ftp', 'rss', 'rssembedded', or 'atcf'},
+    hotstart => {
+        ord => 50, severity => q{error}, category => q{startup},
+        summary => q{HOTORCOLD, COLDSTARTDATE, and LASTSUBDIR must form a usable startup definition; local hotstarts are checked for the files ASGS actually consumes.},
     },
-    FTPSITE => {
-        ord   => 56,
-        req   => 0,
-        check => [ sub { \&_DEFER_CHECK } ],
-        hint  => q{},
+    vortexmodel => {
+        ord => 60, severity => q{error}, category => q{forcing},
+        summary => q{GAHM is not compatible with namBlend, gfsBlend, or rrfsBlend.},
     },
-    RSSSITE => {
-        ord   => 57,
-        req   => 0,
-        check => [ sub { \&_DEFER_CHECK } ],
-        hint  => q{},
+    runtime_assets => {
+        ord => 65, severity => q{error}, category => q{environment},
+        summary => q{ADCIRC/SWAN executable paths already present in the environment are checked by file existence only; no binaries are executed.},
     },
-    WAVES => {
-        ord   => 60,
-        req   => 1,
-        check => [ sub { _IN( @_, qw/on off/ ) } ],
-        hint  => q{Turns SWAN coupling 'on' or 'off'},
+    waves => {
+        ord => 70, severity => q{error}, category => q{waves},
+        summary => q{When WAVES=on, SWAN settings and required executables/templates must be coherent.},
     },
-    VARFLUX => {
-        ord   => 65,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/on off default/ ) } ],
-        hint  => q{Turns on river flux boundary conditions support in ASGS and ADCIRC.},
-    },
-    INTENDEDAUDIENCE => {
-        ord   => 70,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Control type of notifications, 'dev', 'general', ...},
-    },
-    POSTPROCESS => {
-        ord   => 75,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{List of post processing scripts},
-    },
-    OPENDAPNOTIFY => {
-        ord   => 80,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{list of *emails notified when OPENDAPPOST is run via POSTPROCESS},
-    },
-    OPENDAPPOST => {
-        ord   => 80,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{POSTPROCESS script used by THREDDS integration (used by monitoring/logging.sh)},
-    },
-    NOTIFY_SCRIPT => {
-        ord   => 85,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Script to handle notifications},
-    },
-    TDS => {
-        ord   => 90,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{List of thredds servers to upload output},
-    },
-    COLDSTARTDATE => {
-        ord   => 95,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Start date for ramping model from zero state},
-    },
-    HINDCASTLENGTH => {
-        ord   => 100,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Length of time used to cold start},
-    },
-    HOTORCOLD => {
-        ord   => 105,
-        req   => 1,
-        check => [ sub { _IN( @_, qw/coldstart hotstart/ ) } ],
-        hint  => q{Must be: 'coldstart' or 'hotstart'},
-    },
-    LASTSUBDIR => {
-        ord   => 110,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{Used when HOTORCOLD is 'hotstart'.},
-    },
-    QUALITYSETTING => {
-        ord   => 117,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/strict allow-nonfatal-instability/ ) } ],
-        hint  => q{If defined in config, must be: 'strict' or 'allow-nonfatal-instability'.},
-    },
-    QUEUESYS => {
-        ord   => 120,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/mpiexec SLURM PBS/ ) } ],
-        hint  => q{If defined in config, must be: 'mpiexec', 'SLURM', or 'PBS'.},
-    },
-    VORTEXMODEL => {
-        ord   => 125,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/SYMMETRIC ASYMMETRIC GAHM/ ) } ],
-        hint  => q{If defined in config, must be: 'SYMMETRIC', 'ASYMMETRIC', or 'GAHM'.},
-    },
-    SWANDT => {
-        ord   => 130,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{If defined and WAVES=on, reasonable values are integers between 300-1200.},
-    },
-    REINITIALIZESWAN => {
-        ord   => 135,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{If defined and WAVES=on, must be: 'yes' or 'no'.},
-    },
-    SWANTEMPLATE => {
-        ord   => 140,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{If WAVES=on, swaninit.template and $SWANTEMPLATE files must exist in $SCRIPTDIR/input/meshes/common/swan.},
-    },
-    EMAILNOTIFY => {
-        ord   => 145,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/yes no/ ) } ],
-        hint  => q{EMAILNOTIFY must be: 'yes' or 'no'; important for reliably controlling emails sent by POSTPROCESS hook scripts.},
-    },
-    enablePostStatus => {
-        ord   => 146,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/yes no/ ) } ],
-        hint  => q{enablePostStatus,if set, must be: 'yes' or 'no'.},
-    },
-    enableStatusNotify => {
-        ord   => 146,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/yes no/ ) } ],
-        hint  => q{enableStatusNotify,if set, must be: 'yes' or 'no'.},
-    },
-    statusNotify => {
-        ord   => 147,
-        req   => 0,
-        check => [ sub { _CHECK_statusNotify(@_) } ],
-        hint => q{statusNotify must be an email address or set to "null"},
-    },
-    RIVERDATAPROTOCOL => {
-        ord   => 150,
-        req   => 0,
-        check => [ sub { _IN( @_, qw/scp ftp filesystem/ ) } ],
-        hint  => q{must be: 'scp', 'ftp', or 'filesystem' if defined.},
-    },
-    RIVERSITE => {
-        ord   => 151,
-        req   => 0,
-        check => [ sub { _LOOKS_LIKE_REMOTE_HOST(@_) } ],
-        hint  => q{If VARFLUX=on, RIVERSITE may be used to define the server from which river boundary data may be gotten as a fort.20.},
-    },
-    RIVERDIR => {
-        ord   => 152,
-        req   => 0,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{If VARFLUX=on, RIVERDIR may be used to define the directory on RIVERSITE from which river boundary data may be gotten as a fort.20.},
-    },
-    ARCHIVE => {
-        ord   => 155,
-        req   => 0,
-        check => [ sub { _FILE_EXISTS(@_, qq{$SCRIPTDIR/archive}) } ],
-        hint  => q{The file DEFINED by 'ARCHIVE' must exist in $SCRIPTDIR/archive.},
-    },
-    ARCHIVEBASE => {
-        ord   => 160,
-        req   => 0,
-        check => [ sub { _IS_ABSOLUTE_PATH(@_) } ],
-        hint  => q{File path under which $ARCHIVEDIR will be created; ARCHIVEBASE must be an absolute path and will be created if it doesn't exist.},
-    },
-    PREPPEDARCHIVE => {
-        ord   => 170,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{PREPPEDARCHIVE must be defined, it is the name of the .tgz file that stores the archive of prepared files used for each run.},
-    },
-    HINDCASTARCHIVE => {
-        ord   => 175,
-        req   => 1,
-        check => [ \&_DEFER_CHECK ],
-        hint  => q{HINDCASTARCHIVE must be defined, it is the name of the .tgz file that stores the results of the initial hindcast performed when ASGS is first started.},
+    trigger => {
+        ord => 80, severity => q{error}, category => q{forcing},
+        summary => q{TRIGGER and FTPSITE combinations must be compatible.},
     },
 };
 
-# NONE of these variables should ever appear in a configuration file
-my $CONFIG_DISALLOWED = [qw/PERL5LIB LDFLAGS LD_LIBRARY_PATH PERLBREW_HOME ASGS_MESH_DEFAULTS CPPFLAGS PATH LIBRARY_PATH SCRIPTDIR ASGS_PLATFORMS ADCIRCDIR SCRATCH ASGS_BREW_FLAGS PERLBREW_PERL NETCDFHOME ASGS_INSTALL_PATH WORK PERLBREW_PATH PERLBREW_MANPATH MAGICK_HOME ADCIRC_META_DIR ADCIRC_GIT_REPO ASGS_META_DIR LD_RUN_PATH ADCIRC_PROFILE_NAME PERLBREW_ROOT LD_INCLUDE_PATH SWANDIR ASGS_HOME ADCIRC_GIT_BRANCH ASGS_MACHINE_NAME ADCIRC_GIT_URL ADCIRCBASE ASGS_MAKEJOBS PERL_CPANM_HOME ASGS_TMPDIR ASGS_COMPILER ADCIRC_COMPILER _ASGS_EXPORTED_VARS _ASGS_TMP WORK SCRATCH EDITOR PROPERTIESFILE RUNDIR SYSLOG ASGS_CONFIG ADCIRC_MAKE_CMD SWAN_UTIL_BINS_MAKE_CMD ADCSWAN_MAKE_CMD ADCIRC_BINS SWAN_UTIL_BINS ADCSWAN_BINS ADCIRC_BUILD_INFO ASGS_LOCAL_DIR INPUTDIR/];
+my $CONFIG_VARS = d2o {
+    INSTANCENAME       => { ord=>1,   req=>0, hint=>q{Optional; ASGS derives it when omitted or set to auto. Explicit names must contain no whitespace.} },
+    ACCOUNT            => { ord=>2,   req=>1, hint=>q{Allocation account; may be inherited from platform/profile and may be null where supported.} },
+    ASGSADMIN          => { ord=>5,   req=>1, hint=>q{Must be an email address.} },
+    PPN                => { ord=>10,  req=>1, hint=>q{Processors per node; integer greater than 0.} },
+    NCPU               => { ord=>15,  req=>1, hint=>q{Compute ranks; integer greater than 0.} },
+    NUMWRITERS         => { ord=>20,  req=>1, hint=>q{Writer ranks; currently 1 is expected/recommended.} },
+    NCPUCAPACITY       => { ord=>25,  req=>1, hint=>q{Maximum CPUs available to scenarios.} },
+    QUEUENAME          => { ord=>30,  req=>1, hint=>q{Parallel compute queue.} },
+    SERQUEUE           => { ord=>35,  req=>1, hint=>q{Serial/small-job queue.} },
+    SERQUEUE_NTASKS    => { ord=>36,  req=>0, hint=>q{Optional serial-job task request; if set must be 1..PPN.} },
+    GRIDNAME           => { ord=>40,  req=>1, hint=>q{ADCIRC mesh name.} },
+    parameterPackage   => { ord=>41,  req=>0, hint=>q{Mesh parameter package; must be set before mesh_defaults.sh when explicitly configured.} },
+    ADCIRCVERSION      => { ord=>42,  req=>0, hint=>q{Intended ADCIRC version; mesh compatibility checking is deferred to mesh/package analysis.} },
+    BACKGROUNDMET      => { ord=>45,  req=>1, hint=>q{on, off, NAM, OWI, namBlend, GFS, gfsBlend, RRFS, or rrfsBlend.} },
+    TROPICALCYCLONE    => { ord=>50,  req=>1, hint=>q{Must be on or off.} },
+    STORM              => { ord=>51,  req=>0, hint=>q{Tropical cyclone storm number when TROPICALCYCLONE=on.} },
+    YEAR               => { ord=>52,  req=>0, hint=>q{Tropical cyclone year when TROPICALCYCLONE=on.} },
+    BASIN              => { ord=>53,  req=>0, hint=>q{Tropical cyclone basin when TROPICALCYCLONE=on.} },
+    TRIGGER            => { ord=>55,  req=>0, hint=>q{ftp, rss, rssembedded, or atcf.} },
+    FTPSITE            => { ord=>56,  req=>0, hint=>q{ATCF/forcing source endpoint.} },
+    WAVES              => { ord=>60,  req=>1, hint=>q{Must be on or off.} },
+    VARFLUX            => { ord=>65,  req=>0, hint=>q{on, off, or default.} },
+    INTENDEDAUDIENCE   => { ord=>70,  req=>1, hint=>q{Audience classification.} },
+    POSTPROCESS        => { ord=>75,  req=>1, hint=>q{Post-processing scripts.} },
+    OPENDAPNOTIFY      => { ord=>80,  req=>0, hint=>q{OpenDAP notification recipients.} },
+    OPENDAPPOST        => { ord=>81,  req=>0, hint=>q{OpenDAP posting script.} },
+    NOTIFY_SCRIPT      => { ord=>85,  req=>0, hint=>q{Notification script.} },
+    TDS                => { ord=>90,  req=>0, hint=>q{THREDDS server list.} },
+    COLDSTARTDATE      => { ord=>95,  req=>1, hint=>q{Cold-start date or supported automatic value.} },
+    HINDCASTLENGTH     => { ord=>100, req=>1, hint=>q{Cold-start hindcast length.} },
+    HOTORCOLD          => { ord=>105, req=>1, hint=>q{coldstart or hotstart.} },
+    LASTSUBDIR         => { ord=>110, req=>0, hint=>q{Required for HOTORCOLD=hotstart; may be a supported URL or a local directory containing hindcast/nowcast/remote.} },
+    HOTSTARTFORMAT     => { ord=>111, req=>0, hint=>q{binary, netcdf, or netcdf3; ASGS defaults to netcdf.} },
+    QUALITYSETTING     => { ord=>117, req=>0, hint=>q{strict or allow-nonfatal-instability.} },
+    QUEUESYS           => { ord=>120, req=>0, hint=>q{mpiexec, SLURM, or PBS.} },
+    VORTEXMODEL        => { ord=>125, req=>0, hint=>q{SYMMETRIC, ASYMMETRIC, or GAHM.} },
+    SWANDT             => { ord=>130, req=>0, hint=>q{If WAVES=on, reasonable range is 300..1200.} },
+    REINITIALIZESWAN   => { ord=>135, req=>0, hint=>q{If WAVES=on, yes or no.} },
+    SWANTEMPLATE       => { ord=>140, req=>0, hint=>q{SWAN template name.} },
+    EMAILNOTIFY        => { ord=>145, req=>0, hint=>q{yes or no.} },
+    enablePostStatus   => { ord=>146, req=>0, hint=>q{yes or no.} },
+    enableStatusNotify => { ord=>147, req=>0, hint=>q{yes or no.} },
+    statusNotify       => { ord=>148, req=>0, hint=>q{Email address or null.} },
+    RIVERDATAPROTOCOL  => { ord=>150, req=>0, hint=>q{scp, ftp, or filesystem.} },
+    ARCHIVE            => { ord=>155, req=>0, hint=>q{Archive script.} },
+    ARCHIVEBASE        => { ord=>160, req=>0, hint=>q{Absolute archive base path.} },
+    PREPPEDARCHIVE     => { ord=>170, req=>1, hint=>q{Prepared input archive name.} },
+    HINDCASTARCHIVE    => { ord=>175, req=>1, hint=>q{Initial hindcast archive name.} },
+    createWind10mLayer => { ord=>180, req=>0, hint=>q{yes or no; yes is the modern preferred mode.} },
+};
 
-#
-# C H E C K  R O U T I N E S
-#
+my $CONFIG_DISALLOWED = [qw/
+    PERL5LIB LDFLAGS LD_LIBRARY_PATH PERLBREW_HOME ASGS_MESH_DEFAULTS CPPFLAGS PATH
+    LIBRARY_PATH SCRIPTDIR ASGS_PLATFORMS ADCIRCDIR SCRATCH ASGS_BREW_FLAGS PERLBREW_PERL
+    NETCDFHOME ASGS_INSTALL_PATH WORK PERLBREW_PATH PERLBREW_MANPATH MAGICK_HOME ADCIRC_META_DIR
+    ADCIRC_GIT_REPO ASGS_META_DIR LD_RUN_PATH ADCIRC_PROFILE_NAME PERLBREW_ROOT LD_INCLUDE_PATH
+    SWANDIR ASGS_HOME ADCIRC_GIT_BRANCH ASGS_MACHINE_NAME ADCIRC_GIT_URL ADCIRCBASE ASGS_MAKEJOBS
+    PERL_CPANM_HOME ASGS_TMPDIR ASGS_COMPILER ADCIRC_COMPILER _ASGS_EXPORTED_VARS _ASGS_TMP EDITOR
+    PROPERTIESFILE RUNDIR SYSLOG ASGS_CONFIG ADCIRC_MAKE_CMD SWAN_UTIL_BINS_MAKE_CMD ADCSWAN_MAKE_CMD
+    ADCIRC_BINS SWAN_UTIL_BINS ADCSWAN_BINS ADCIRC_BUILD_INFO ASGS_LOCAL_DIR INPUTDIR PLATFORM_INIT
+/];
 
-sub fatal_filecheck_ASGS_CONFIG {
-    my ( $self, $o ) = @_;
-    assert_FATAL(qq{ASGS_CONFIG: not defined.}) if not $ASGS_CONFIG;
-    assert_FATAL(
-        sprintf qq{ASGS_CONFIG: '%s' doesn't exist or can't be found.},
-        $ASGS_CONFIG
-    ) if not -e $ASGS_CONFIG;
-    return EXIT_SUCCESS;
+sub _reset_findings { $FINDINGS = []; return; }
+sub _finding {
+    my ($self, $severity, $rule, $message) = @_;
+    push @$FINDINGS, h2o { severity=>$severity, rule=>$rule, message=>$message };
+    return;
 }
+sub assert_FATAL($) { __PACKAGE__->_finding(q{error}, q{legacy}, shift); }
+sub assert_WARNING($) { __PACKAGE__->_finding(q{warning}, q{legacy}, shift); }
 
-sub fatal_encodingcheck_ASGS_CONFIG {
-    my ( $self, $o ) = @_;
-
-    my $file = $ENV{ASGS_CONFIG};
-
-    if ( not defined $file or $file eq q{} ) {
-        warn(q{ASGS_CONFIG: not defined.});
-        exit EXIT_ERROR;
-    }
-
-    if ( not -e $file ) {
-        warn(qq{ASGS_CONFIG: file '$file' does not exist.});
-        exit EXIT_ERROR;
-    }
-
-    if ( not -r $file ) {
-        warn(qq{ASGS_CONFIG: file '$file' is not readable.});
-        exit EXIT_ERROR;
-    }
-
-    open my $fh, '<:raw', $file
-        or assert_FATAL(qq{ASGS_CONFIG: cannot open '$file': $!});
-
+sub _slurp {
+    my ($self, $file, $raw) = @_;
+    return unless defined $file && length $file && -e $file && -r $file;
+    open my $fh, $raw ? '<:raw' : '<', $file or return;
     local $/;
-    my $data = <$fh>;
+    my $text = <$fh>;
     close $fh;
-
-    if ( $data =~ /\x00/ ) {
-        assert_FATAL(qq{ASGS_CONFIG: contains NUL (binary) bytes.});
-    }
-
-    if ( $data =~ /\r\n/ ) {
-        assert_FATAL(qq{ASGS_CONFIG: contains Windows (CRLF) line endings.});
-    }
-
-    if ( $data =~ /\r(?!\n)/ ) {
-        assert_FATAL(qq{ASGS_CONFIG: contains old Mac (CR) line endings.});
-    }
-
-    my $decoded;
-    eval {
-        require Encode;
-        $decoded = Encode::decode('UTF-8', $data, Encode::FB_CROAK);
-        1;
-    } or do {
-        assert_FATAL(qq{ASGS_CONFIG: invalid UTF-8 encoding detected.});
-    };
-
-    if ( $decoded =~ /[^\x09\x0A\x20-\x7E]/ ) {
-        assert_FATAL(qq{ASGS_CONFIG: contains non-printable or invalid control characters.});
-    }
-
-    return EXIT_SUCCESS;
+    return $text;
 }
 
-sub fatal_configcheck_asgsh_vars {
-    my ( $self, $o ) = @_;
-
-    foreach my $var (@$CONFIG_DISALLOWED) {
-        my ( $var_found, $value ) = $self->_extract_from_config_no_ENV($var);
-        if ($var_found) {
-            assert_FATAL(
-                sprintf qq{'%s' should not exist in the config file, '%s'.},
-                $var, $ASGS_CONFIG
-            );
-        }
+sub _strip_shell_comment {
+    my ($self, $line) = @_;
+    my ($sq,$dq,$esc) = (0,0,0);
+    my $out = q{};
+    for my $c (split //, $line) {
+        if ($esc) { $out .= $c; $esc=0; next; }
+        if ($c eq q{\\} && !$sq) { $out .= $c; $esc=1; next; }
+        if ($c eq q{'} && !$dq) { $sq=!$sq; $out .= $c; next; }
+        if ($c eq q{"} && !$sq) { $dq=!$dq; $out .= $c; next; }
+        last if $c eq q{#} && !$sq && !$dq;
+        $out .= $c;
     }
-
-    return 1;
+    return $out;
 }
 
-sub maybe_fatal_configcheck_missing {
-    my ( $self, $o ) = @_;
-
-    foreach my $var ( sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS ) {
-        if ( $CONFIG_VARS->$var->req ) {
-            if ( not _DEFINED->( __PACKAGE__, $o, $var ) ) {
-                my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->$var->hint;
-                assert_FATAL(
-                    sprintf qq{'%s' not defined in '%s'!\n%s},
-                    $var, $ASGS_CONFIG, $hint
-                );
-            }
-        }
-        foreach my $check ( $CONFIG_VARS->$var->check->all ) {
-            if ( q{CODE} eq ref $check and _DEFINED->( __PACKAGE__, $o, $var ) ) {
-                if ( not $check->( __PACKAGE__, $o, $var ) ) {
-                    my $hint = sprintf q{%s - %s}, $var, $CONFIG_VARS->$var->hint;
-                    assert_FATAL(
-                        sprintf qq{'%s' check failed in '%s'!\n%s},
-                        $var, $ASGS_CONFIG, $hint
-                    );
-                }
-            }
-        }
-    }
-
-    return 1;
+sub _parse_assignment_line {
+    my ($self, $line) = @_;
+    $line = $self->_strip_shell_comment($line // q{});
+    return if $line =~ /^\s*$/;
+    return unless $line =~ /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*;?\s*$/;
+    my ($name,$raw) = ($1,$2);
+    my $value = $raw;
+    if ($value =~ /^"(.*)"$/s || $value =~ /^'(.*)'$/s) { $value = $1; }
+    return ($name,$value,$raw);
 }
 
-sub fatal_configcheck_FORCINGS {
-    my ( $self, $o ) = @_;
-
-    my ( undef, $BACKGROUNDMET )   = $self->_extract_from_config(q{BACKGROUNDMET});
-    my ( undef, $TROPICALCYCLONE ) = $self->_extract_from_config(q{TROPICALCYCLONE});
-
-    my %bg_allowed = map { $_ => 1 } qw/on off NAM OWI namBlend GFS gfsBlend RRFS rrfsBlend/;
-    my %tc_allowed = map { $_ => 1 } qw/on off/;
-    my %blend_bg   = map { $_ => 1 } qw/namBlend gfsBlend rrfsBlend/;
-
-    assert_FATAL(
-        sprintf qq{BACKGROUNDMET '%s' is invalid in '%s'.},
-        defined $BACKGROUNDMET ? $BACKGROUNDMET : q{undef}, $ASGS_CONFIG
-    ) if !defined $BACKGROUNDMET || !$bg_allowed{$BACKGROUNDMET};
-
-    assert_FATAL(
-        sprintf qq{TROPICALCYCLONE '%s' is invalid in '%s'.},
-        defined $TROPICALCYCLONE ? $TROPICALCYCLONE : q{undef}, $ASGS_CONFIG
-    ) if !defined $TROPICALCYCLONE || !$tc_allowed{$TROPICALCYCLONE};
-
-    assert_FATAL(
-        sprintf qq{BACKGROUNDMET and TROPICALCYCLONE cannot both be 'off' in '%s'.},
-        $ASGS_CONFIG
-    ) if $BACKGROUNDMET eq q{off} && $TROPICALCYCLONE eq q{off};
-
-    assert_FATAL(
-        sprintf qq{BACKGROUNDMET '%s' requires TROPICALCYCLONE='on' in '%s'.},
-        $BACKGROUNDMET, $ASGS_CONFIG
-    ) if $blend_bg{$BACKGROUNDMET} && $TROPICALCYCLONE ne q{on};
-
-    assert_FATAL(
-        sprintf qq{BACKGROUNDMET='on' and TROPICALCYCLONE='on' are not compatible in '%s'.},
-        $ASGS_CONFIG
-    ) if $BACKGROUNDMET eq q{on} && $TROPICALCYCLONE eq q{on};
-
-    return 1;
+sub _static_expand {
+    my ($self, $value, $known) = @_;
+    return (undef, q{dynamic}) if !defined $value;
+    # Recognize this ASGS helper expression as a valid symbolic value without
+    # executing it. All other command substitutions remain deliberately dynamic.
+    return (q{$(get-coldstart-date)}, q{recognized-command})
+        if $value =~ /^\$\(\s*get-coldstart-date\s*\)$/;
+    return (undef, q{dynamic}) if $value =~ /`|\$\(|<\(|>\(/;
+    my $v = $value;
+    $v =~ s/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/exists $known->{$1} ? $known->{$1} : exists $ENV{$1} ? $ENV{$1} : "\0$1\0"/ge;
+    $v =~ s/\$([A-Za-z_][A-Za-z0-9_]*)/exists $known->{$1} ? $known->{$1} : exists $ENV{$1} ? $ENV{$1} : "\0$1\0"/ge;
+    return (undef, q{unresolved}) if $v =~ /\0/;
+    return ($v, q{static});
 }
 
-sub fatal_configcheck_CPUs {
-    my ( $self, $o ) = @_;
-
-    my $var_found;
-    ( $var_found, my $PPN )          = $self->_extract_from_config(q{PPN});
-    ( $var_found, my $NCPU )         = $self->_extract_from_config(q{NCPU});
-    ( $var_found, my $NUMWRITERS )   = $self->_extract_from_config(q{NUMWRITERS});
-    ( $var_found, my $NCPUCAPACITY ) = $self->_extract_from_config(q{NCPUCAPACITY});
-
-    assert_FATAL(
-        sprintf qq{NCPU+NUMWRITER exceeds NCPUCAPACITY in '%s'},
-        $ASGS_CONFIG
-    ) if ( $NCPU + $NUMWRITERS > $NCPUCAPACITY );
-
-    return 1;
+sub _parse_assignments {
+    my ($self, $text, $seed) = @_;
+    my %known = %{ $seed || {} };
+    my %vars;
+    my $line_no = 0;
+    for my $line (split /\n/, $text // q{}) {
+        ++$line_no;
+        my ($name,$value,$raw) = $self->_parse_assignment_line($line);
+        next unless defined $name;
+        my ($resolved,$status) = $self->_static_expand($value, \%known);
+        $vars{$name} = h2o { value=>$resolved, raw=>$value, status=>$status, line=>$line_no };
+        $known{$name} = $resolved if defined $resolved;
+    }
+    return \%vars;
 }
 
-sub fatal_configcheck_HOTORCOLD {
-    my ( $self, $o ) = @_;
-
-    my $var_found;
-    ( $var_found, my $LASTSUBDIR ) = $self->_extract_from_config(q{LASTSUBDIR});
-    ( $var_found, my $HOTORCOLD )  = $self->_extract_from_config(q{HOTORCOLD});
-
-    if ( ( not $LASTSUBDIR or $LASTSUBDIR eq q{null} ) and $HOTORCOLD eq q{hotstart} and ( not $STATEFILE or not -e $STATEFILE ) ) {
-        assert_FATAL(
-            sprintf qq{LASTSUBDIR can't be 'null' if HOTORCOLD=hotstart in '%s' and STATEFILE doesn't exist.},
-            $ASGS_CONFIG
-        );
-    }
-
-    if ( $STATEFILE and -e $STATEFILE ) {
-        my $var_found;
-        ( $var_found, my $LASTSUBDIR ) = $self->_extract_from_statefile(q{LASTSUBDIR});
-        if ( ( not $LASTSUBDIR or $LASTSUBDIR eq q{null} ) and $HOTORCOLD eq q{hotstart} ) {
-            assert_FATAL(
-                sprintf qq{LASTSUBDIR can't be 'null' in STATEFILE if HOTORCOLD=hotstart in '%s' and STATEFILE exists.},
-                $ASGS_CONFIG
-            );
-        }
-    }
-
-    return 1;
-}
-
-# Note: will only check if $VORTEXMODEL is defined, which
-# must be accounted for since this is part of the more in-depth
-# variable conflict checks
-sub fatal_configcheck_VORTEXMODEL_if_DEFINED {
-    my ( $self, $o ) = @_;
-
-    my ( $var_found, $BACKGROUNDMET ) = $self->_extract_from_config(q{BACKGROUNDMET});
-    ( $var_found, my $VORTEXMODEL ) = $self->_extract_from_config(q{VORTEXMODEL});
-
-    return EXIT_SUCCESS if not $VORTEXMODEL;
-
-    if ( $VORTEXMODEL eq q{GAHM} and (grep { $_ =~ m/$BACKGROUNDMET/ } (qw/namBlend gfsBlend rrfsBlend/) )) {
-        assert_FATAL(
-            sprintf qq{VORTEXMODEL can't be 'GAHM' when BACKGROUNDMET is 'namBlend', 'gfsBlend', or 'rrfsBlend' in '%s'.},
-            $ASGS_CONFIG
-        );
-    }
-
-    return 1;
-}
-
-sub _extract_mesh_info {
-    my ( $self, $cases, $file ) = @_;
-
-    return $cases if not -e $file;
-
-    local $/;
-    open my $FH, q{<}, $file || die $!;
-    my $config = <$FH>;
-
-    my $START  = 0;
-    my @cases  = ();
-    my @names  = ();
-
-  LINE:
-    foreach my $line ( split /\n/, $config ) {
-        last LINE if ( $line =~ m/^esac/ );
-        ++$START  if ( $line =~ m/^case/ );
-        next LINE unless  $START > 0;
-        if ( $line =~ m/^ *([0-9a-zA-Z"_|*-]+)\)/ ) {
-            my $case = $1;
-            $case =~ s/["']//g;
-            @names = split / *\| */, $case;
-            next LINE;
-        }
-        next LINE if not @names;
-
-        foreach my $case (@names) {
-          push @{ $cases->{$case} }, $line;
-        }
-
-        if ( $line =~ m/;;/ ) {
-            @names = ();
-        }
-    }
-
-    close $FH;
-
-    return $cases;
-}
-
-sub _extract_scenarios_from_config {
-    my ( $self ) = @_;
-
-    local $/;
-    open my $FH, q{<}, $ASGS_CONFIG || die $!;
-    my $config = <$FH>;
-    my $START  = 0;
-    my $cases  = {};
-    my @cases  = ();
-  LINE:
-    foreach my $line ( split /\n/, $config ) {
-        last LINE if ( $line =~ m/^esac/ );
-        ++$START  if ( $line =~ m/^SCENARIOPACKAGESIZE/ );
-        next LINE if not $START;
-        ++$START  if ( $line =~ m/^case/ );
-        next LINE if 2 > $START;
-        if ( $line =~ m/^ *(-?\d)\)/ or $line =~ m/^ *(\*)\)/ ) {
-            my $index = $1;
-            push @cases, $index;
-            next LINE;
-        }
-        if ( $#cases >= 0 ) {
-            if ( $line =~ m/;;/ ) {
-                $line .= q{ # <~ end of case};
-            }
-            push @{ $cases->{ $cases[-1] } }, $line;
-        }
-    }
-    close $FH;
-    return $cases;
-}
-
-sub fatal_bincheck_ADCIRC {
-    my ( $self, $o ) = @_;
-
-    if ( not $ADCIRCDIR or not $ADCIRC_BINS ) {
-        assert_FATAL(q{ADCIRCDIR and ADCIRC_BINS must be available in the environment.});
-    }
-
-    foreach my $bin ( split /\s+/, $ADCIRC_BINS ) {
-        if ( not $self->_BIN_OK( $ADCIRCDIR, $bin ) ) {
-            assert_FATAL( sprintf qq{$bin is not found, but is required to be available via PATH to continue.} );
-        }
-    }
-
-    return 1;
-}
-
-sub query_ADCIRC_version {
-    $ADCIRC_VERSION = `adcirc -v`;
-    return $ADCIRC_VERSION;
-};
-
-sub fatal_configcheck_WAVES_if_on {
-    my ( $self, $o ) = @_;
-
-    my $var_found;
-    ( $var_found, my $WAVES ) = $self->_extract_from_config(q{WAVES});
-    return EXIT_SUCCESS if ( $WAVES eq q{off} );
-
-    ( $var_found, my $SWANDT ) = $self->_extract_from_config(q{SWANDT});
-    if ( $SWANDT and not $self->_IS_IN_RANGE( q{SWANDT}, 300, 1200 ) ) {
-        assert_FATAL(
-            sprintf qq{SWANDT must be defined if WAVES=on, in the range 300-1200, in '%s'.},
-            $ASGS_CONFIG
-        );
-    }
-
-    ( $var_found, my $REINITIALIZESWAN ) = $self->_extract_from_config(q{REINITIALIZESWAN});
-    if ( !defined $REINITIALIZESWAN || $REINITIALIZESWAN !~ m/^(yes|no)$/ ) {
-        assert_FATAL(
-            sprintf qq{REINITIALIZESWAN must be defined if WAVES=on, and must be 'yes' or 'no', in '%s'.},
-            $ASGS_CONFIG
-        );
-    }
-
-    if (   not $ADCIRCDIR
-        or not $self->_BIN_OK( $ADCIRCDIR, q{adcswan} )
-        or not $self->_BIN_OK( $ADCIRCDIR, q{padcswan} ) ) {
-        assert_FATAL( sprintf qq{adcswan and padswan are required if WAVES=on, via ADCIRCDIR which should be preferably defined in the environment.} );
-    }
-
-    if (   not $SWANDIR
-        or not -x sprintf( q{%s/%s}, $SWANDIR, q{unhcat.exe} )
-        or system(q{which unhcat.exe > /dev/null 2>&1}) != EXIT_SUCCESS ) {
-        assert_FATAL( sprintf qq{unhcat.exe required if WAVES=on, via SWANDIR which should be preferably defined in the environment.} );
-    }
-
-    ( $var_found, my $SWANTEMPLATE ) = $self->_extract_from_config(q{SWANTEMPLATE});
-    if (
-        $var_found
-        and (  not -e sprintf( q{%s/%s}, $SCRIPTDIR, q{swaninit.template} )
-            or not -e sprintf( q{%s/%s}, $SCRIPTDIR, $SWANTEMPLATE ) )
-    ) {
-        assert_FATAL( $CONFIG_VARS->SWANTEMPLATE->hint );
-    }
-
-    return 1;
-}
-
-sub fatal_configcheck_get_atcf {
-    my ( $self, $o ) = @_;
-
-    my $var_found;
-    ( $var_found, my $TRIGGER ) = $self->_extract_from_config(q{TRIGGER});
-    ( $var_found, my $FTPSITE ) = $self->_extract_from_config(q{FTPSITE});
-
-    if ($FTPSITE and $TRIGGER and $FTPSITE eq q{filesystem} and $TRIGGER eq q{ftp}) {
-      assert_FATAL( qq{'TRIGGER=ftp' is not compatible with 'FTPSITE=filesystem'.} );
-    }
-
-    return 1;
-}
-
-sub _get_grid_info {
-  my ($self, $GRIDNAME) = @_;
-
-  my $meshes = __PACKAGE__->_extract_mesh_info( {}, $MESH_DEFAULTS);
-  $meshes    = __PACKAGE__->_extract_mesh_info( $meshes, $LOCAL_MESH_DEFAULTS);
-
-  $meshes->{$GRIDNAME} //= [];
-
-  my $block  = join qq{\n}, @{$meshes->{$GRIDNAME}};
-
-  return $block;
-}
-
-sub _expand_shell_var {
-  my ($self, $string, $VAR, $value) = @_;
-
-  return $string if not $string;
-
-  $string =~ s/\$?{?$VAR}?/$value/;
-  return $string;
-}
-
-sub fatal_configcheck_GRIDNAME {
-    my ( $self, $o ) = @_;
-    my $var_found;
-    ( $var_found, my $GRIDNAME) = $self->_extract_from_config(q{GRIDNAME});
-    my $grid_info               = $self->_get_grid_info($GRIDNAME);
-
-    if ( not $grid_info )  {
-      assert_FATAL( sprintf qq{GRIDNAME '%s' can't be found.}, $GRIDNAME );
-    }
-
-    return 1;
-}
-
-sub fatal_configcheck_VARFLUX {
-    my ( $self, $o ) = @_;
-
-    my ( $var_found, $GRIDNAME)   = $self->_extract_from_config(q{GRIDNAME});
-    my $mesh_info                 = $self->_get_grid_info($GRIDNAME);
-
-    ( $var_found, my $VARFLUX)    = $self->_extract_from_config(q{VARFLUX});
-
-    ( $var_found, my $INPUTDIR)           = $self->_extract_from_string(q{INPUTDIR}, $mesh_info);
-    ( $var_found, my $RIVERFLUX)          = $self->_extract_from_string(q{RIVERFLUX}, $mesh_info);
-    ( $var_found, my $RIVERINIT)          = $self->_extract_from_string(q{RIVERINIT}, $mesh_info);
-    ( $var_found, my $HINDCASTRIVERFLUX)  = $self->_extract_from_string(q{HINDCASTRIVERFLUX}, $mesh_info);
-
-    $INPUTDIR = $self->_expand_shell_var($INPUTDIR, q{SCRIPTDIR}, $SCRIPTDIR);
-
-    if ( $VARFLUX and ( grep { /$VARFLUX/ } qw/on default/ ) and $RIVERINIT and $RIVERINIT ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERINIT;
-      $ADCIRC_VERSION =~ m/v(\d+)/;
-      my $adcv = $1 // 1_000_000;
-      if ( $adcv < 53 && ( !-e $file || !-s $file ) ) {
-        assert_FATAL( q{When VARFLUX=on or default, and ADCIRC version < v53, ${INPUTDIR}/${RIVERINIT} must exist and not be empty.});
-      }
-    }
-
-    if ( $VARFLUX and $VARFLUX eq q{default} and $RIVERFLUX and $RIVERFLUX ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $RIVERFLUX;
-      if ( !-e $file || !-s $file ) {
-        assert_FATAL( q{When VARFLUX=default, ${INPUTDIR}/${RIVERFLUX} must exist and not be empty.});
-      }
-    }
-
-    if ( $VARFLUX and ( grep { /$VARFLUX/ } qw/on default/ ) and $HINDCASTRIVERFLUX and $HINDCASTRIVERFLUX ne q{null} ) {
-      my $file = sprintf qq{%s/%s}, $INPUTDIR, $HINDCASTRIVERFLUX;
-      if ( !-e $file || !-s $file ) {
-        assert_FATAL( q{When VARFLUX=on or default, ${INPUTDIR}/${HINDCASTRIVERFLUX} must exist and not be empty.});
-      }
-    }
-
-    return 1;
-}
-
-#
-# V A L I D A T I O N  R O U T I N E S
-#
-
-sub _DEFER_CHECK {
-    my ( $self, $o, $var ) = @_;
-    return 1;
-}
-
-sub _BIN_OK {
-    my ( $self, $base_path, $bin_name ) = @_;
-    if ( not -x sprintf( q{%s/%s}, $base_path, $bin_name )
-        or system(qq{which $bin_name > /dev/null 2>&1}) != EXIT_SUCCESS ) {
-        return undef;
-    }
-    return 1;
-}
-
-sub _IN {
-    my ( $self, $o, $var, @valid_list ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( not $CFG_VALUE or not grep { $_ =~ m/^$CFG_VALUE$/ } @valid_list ) {
-        return undef;
-    }
-    return 1;
-}
-
-sub _INT {
-    my ( $self, $o, $var ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    {
-      no warnings 'numeric';
-      if ( int $CFG_VALUE < 1 ) {
-        return undef;
-      }
-    }
-    return 1;
-}
-
-sub _IS_ONE {
-    my ( $self, $o, $var ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    {
-      no warnings 'numeric';
-      if ( int $CFG_VALUE != 1 ) {
-          return undef;
-      }
-    }
-    return 1;
-}
-
-sub _IS_IN_RANGE {
-    my ( $self, $o, $var, $min, $max ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    {
-      no warnings 'numeric';
-      if ( int $CFG_VALUE < $min or int $CFG_VALUE > $max ) {
-          return undef;
-      }
-    }
-    return 1;
-}
-
-sub _exists {
-    my ( $self, $var ) = @_;
-    my ($var_found, undef) = $self->_extract_from_config_no_ENV($var);
-
-    return 1 if $var_found;
-    return 1 if exists $ENV{$var};
-
-    return undef;
-}
-
-sub _DEFINED {
-    my ( $self, $o, $var ) = @_;
-
-    return undef if not $self->_exists($var);
-
-    my ( $var_found, $CFG_VALUE ) = $self->_extract_from_config($var);
-
-    # diagnostic output when -v is set
-    printf STDERR qq{(INFO: _DEFINED sub): %-20s is "%s" \n}, $var, $CFG_VALUE // q{undefined} if $o->v;
-
-    if ( not $var_found or not defined $CFG_VALUE ) {
-        return undef;
-    }
-    return 1;
-}
-
-sub _DIR_EXISTS {
-    my ( $self, $o, $var, $subdir ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    my $file = ($subdir) ? qq{$subdir/$CFG_VALUE} : qq{$CFG_VALUE};
-    if ( not -d $file ) {
-      return undef;
-    }
-    return 1;
-}
-
-sub _FILE_EXISTS {
-    my ( $self, $o, $var, $subdir ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    my $file = ($subdir) ? qq{$subdir/$CFG_VALUE} : qq{$CFG_VALUE};
-    if ( not -e $file ) {
-      return undef;
-    }
-    return 1;
-}
-
-sub _IS_ABSOLUTE_PATH {
-    my ( $self, $o, $var ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-    if ( $CFG_VALUE !~ m{^/} ) {
-      return undef;
-    }
-    return 1;
-}
-
-sub _LOOKS_LIKE_REMOTE_HOST {
-    my ( $self, $o, $var ) = @_;
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-
-    return undef if !defined $CFG_VALUE || $CFG_VALUE eq q{};
-
-    my $is_ipv4 = $CFG_VALUE =~ m/^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/;
-    my $is_host = $CFG_VALUE =~ m/^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/;
-
-    return ( $is_ipv4 || $is_host ) ? 1 : undef;
-}
-
-sub _LOOKS_LIKE_EMAIL_ADDRESS {
-    my ( $self, $o, $var ) = @_;
-
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-
-    return undef unless defined $CFG_VALUE and length $CFG_VALUE;
-
-    if (
-        not $CFG_VALUE =~ m{
-            ^
-            [A-Za-z0-9._%+\-]+
-            \@
-            (?:[A-Za-z0-9]
-               (?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?
-               \.
-            )+
-            [A-Za-z]{2,}
-            $
-        }x
-    ) {
-        return undef;
-    }
-    return 1;
-}
-
-sub _CHECK_statusNotify {
-    my ( $self, $o, $var ) = @_;
-
-    my $var_found;
-    ( $var_found, my $CFG_VALUE ) = $self->_extract_from_config($var);
-
-    return undef unless defined $CFG_VALUE and length $CFG_VALUE;
-
-    return 1 if $CFG_VALUE =~ m/^null$/;
-
-    return 1 if _LOOKS_LIKE_EMAIL_ADDRESS(@_); 
-
-    return undef;
-}
-
-#
-# U T I L I T Y  R O U T I N E S
-#
-
-sub _extract_from_string {
-    my ( $self, $varname, $text ) = @_;
-
-    my $re_var = quotemeta($varname);
-
-    if (
-        $text =~ m{
-            ^\s*
-            (?:export\s+)?
-            ($re_var)
-            \s*=\s*
-            (?:
-                "((?:\\.|[^"])*)"
-              | '([^']*)'
-              | (\(
-                    (?:
-                        [^()"'\\]
-                      | \\ .
-                      | " (?:\\.|[^"])* "
-                      | ' [^']* '
-                    )*
-                 \))
-              | ([^[:space:]#;]*)
-            )
-            \s*(?:\#.*)?
-            $
-        }mx
-    ) {
-        my $name  = $1;
-        my $value = defined $2 ? $2
-                  : defined $3 ? $3
-                  : defined $4 ? $4
-                  : $5;
-
-        return ( $name, $value );
-    }
-
+sub _config_text { my ($self)=@_; return $self->{config_text} // q{}; }
+sub _config_assignments { my ($self)=@_; return $self->{config_vars} ||= $self->_parse_assignments($self->_config_text, { %ENV }); }
+
+sub _config_value {
+    my ($self,$name) = @_;
+    my $vars = $self->_config_assignments;
+    if (exists $vars->{$name} && defined $vars->{$name}->value) { return ($vars->{$name}->value, q{config}); }
+    return ($ENV{$name}, q{environment}) if exists $ENV{$name} && defined $ENV{$name} && length $ENV{$name};
     return;
 }
 
 sub _extract_from_config_no_ENV {
-    my ( $self, $varname ) = @_;
-
-    local $/;
-    open my $FH, '<', $ASGS_CONFIG
-        or die "Could not open '$ASGS_CONFIG': $!";
-
-    my $config = <$FH>;
-
-    close $FH
-        or die "Could not close '$ASGS_CONFIG': $!";
-
-    my ($name, $value) = $self->_extract_from_string( $varname, $config );
-
-    return ($name, $value);
+    my ($self,$name)=@_;
+    my $vars=$self->_config_assignments;
+    return unless exists $vars->{$name};
+    return ($name,$vars->{$name}->value);
+}
+sub _extract_from_config {
+    my ($self,$name)=@_;
+    my ($value)= $self->_config_value($name);
+    return defined $value ? ($name,$value) : ();
 }
 
-sub _extract_from_config {
-    my ( $self, $varname ) = @_;
+sub _find_scenario_block {
+    my ($self)=@_;
+    my @lines=split /\n/, $self->_config_text;
+    my ($start,$end,$depth);
+    for my $i (0..$#lines) {
+        my $clean=$self->_strip_shell_comment($lines[$i]);
+        if (!defined $start && $clean =~ /^\s*case\s+\$\{?si\}?\s+in\s*$/) { $start=$i; $depth=1; next; }
+        next unless defined $start;
+        ++$depth if $clean =~ /^\s*case\b.*\bin\s*$/;
+        if ($clean =~ /^\s*esac\b/) { --$depth; if ($depth==0) { $end=$i; last; } }
+    }
+    return unless defined $start && defined $end;
+    return (\@lines,$start,$end);
+}
 
-    local $/;
-    open my $FH, '<', $ASGS_CONFIG
-        or die "Could not open '$ASGS_CONFIG': $!";
+sub _parse_scenarios {
+    my ($self)=@_;
+    my ($lines,$start,$end)=$self->_find_scenario_block;
+    return h2o { found=>0, cases=>{}, order=>[] } unless $lines;
+    my %cases; my @order; my $current;
+    for my $i ($start+1..$end-1) {
+        my $clean=$self->_strip_shell_comment($lines->[$i]);
+        if ($clean =~ /^\s*(-?\d+|\*)\s*\)\s*$/) {
+            $current=$1;
+            if (!exists $cases{$current}) { $cases{$current}=h2o { index=>$current, lines=>[], vars=>{}, line=>$i+1, duplicate_lines=>[] }; push @order,$current; }
+            else { push @{ $cases{$current}->duplicate_lines }, $i+1; }
+            next;
+        }
+        next unless defined $current;
+        last if $clean =~ /^\s*esac\b/;
+        if ($clean =~ /;;/) { $current=undef; next; }
+        push @{ $cases{$current}->lines }, $lines->[$i];
+        my ($n,$v)=$self->_parse_assignment_line($lines->[$i]);
+        $cases{$current}->vars->{$n}=$v if defined $n;
+    }
+    return h2o { found=>1, start_line=>$start+1, end_line=>$end+1, cases=>\%cases, order=>\@order };
+}
 
-    my $config = <$FH>;
+sub _resolve_platform {
+    my ($self)=@_;
+    return $self->{platform} if $self->{platform};
+    my $platform_init=$ENV{PLATFORM_INIT};
+    if (defined $platform_init && length $platform_init) {
+        my $p=h2o { style=>q{PLATFORM_INIT}, path=>$platform_init, vars=>{}, name=>($ENV{ASGS_MACHINE_NAME}||$ENV{HPCENVSHORT}||q{unknown}) };
+        if (!-e $platform_init) { $self->_finding(q{error},q{platform_definition},"PLATFORM_INIT '$platform_init' does not exist."); return $self->{platform}=$p; }
+        if (!-r $platform_init) { $self->_finding(q{error},q{platform_definition},"PLATFORM_INIT '$platform_init' is not readable."); return $self->{platform}=$p; }
+        my $text=$self->_slurp($platform_init);
+        $p->{vars}=$self->_parse_assignments($text,{%ENV});
+        return $self->{platform}=$p;
+    }
+    my $legacy=$ENV{ASGS_PLATFORMS} || (($ENV{SCRIPTDIR}||q{}) ? "$ENV{SCRIPTDIR}/platforms.sh" : q{});
+    my $name=$ENV{ASGS_MACHINE_NAME} || $ENV{HPCENVSHORT};
+    my $p=h2o { style=>q{ASGS_PLATFORMS}, path=>$legacy, vars=>{}, name=>($name||q{unknown}) };
+    return $self->{platform}=$p unless $legacy;
+    if (!-e $legacy) { $self->_finding(q{warning},q{platform_definition},"Legacy ASGS_PLATFORMS '$legacy' does not exist; platform defaults cannot be inspected."); return $self->{platform}=$p; }
+    if (!-r $legacy) { $self->_finding(q{warning},q{platform_definition},"Legacy ASGS_PLATFORMS '$legacy' is not readable; platform defaults cannot be inspected."); return $self->{platform}=$p; }
+    return $self->{platform}=$p unless $name;
+    my $text=$self->_slurp($legacy);
+    if ($text =~ /(?:^|\n)\s*init_\Q$name\E\s*\(\)\s*\{(.*?)\n\}/s) {
+        $p->{vars}=$self->_parse_assignments($1,{%ENV});
+    } else {
+        $self->_finding(q{warning},q{platform_definition},"Could not statically locate legacy init_${name}() in '$legacy'.");
+    }
+    return $self->{platform}=$p;
+}
 
-    close $FH
-        or die "Could not close '$ASGS_CONFIG': $!";
+sub _effective_value {
+    my ($self,$name)=@_;
+    my $cfg=$self->_config_assignments;
+    if (exists $cfg->{$name} && defined $cfg->{$name}->value) { return ($cfg->{$name}->value,q{config}); }
+    return ($ENV{$name},q{environment}) if exists $ENV{$name} && defined $ENV{$name} && length $ENV{$name};
+    my $p=$self->_resolve_platform;
+    if ($p && exists $p->vars->{$name} && defined $p->vars->{$name}->value) { return ($p->vars->{$name}->value,q{platform}); }
+    return;
+}
 
-    my ($name, $value) = $self->_extract_from_string( $varname, $config );
+sub _mesh_defaults_source_line {
+    my ($self)=@_;
+    my $n=0;
+    for my $line (split /\n/, $self->_config_text) {
+        ++$n;
+        my $clean=$self->_strip_shell_comment($line);
+        next if $clean =~ /^\s*$/;
+        if ($clean =~ /^\s*(?:source|\.)\s+['\"]?([^'\"\s;]+mesh_defaults\.sh)['\"]?\s*;?\s*$/) {
+            return ($n,$1);
+        }
+    }
+    return;
+}
 
-    if (not $value and $value = $ENV{$varname}) {
-      $name = $varname;
+sub _derive_instancename {
+    my ($self)=@_;
+    my ($explicit,$src)=$self->_effective_value(q{INSTANCENAME});
+    if (defined $explicit && length $explicit && $explicit ne q{auto}) {
+        return ($explicit,$src,[]);
     }
 
-    return ($name, $value);
+    my @missing;
+    my ($grid)=$self->_effective_value(q{GRIDNAME});
+    my ($tc)=$self->_effective_value(q{TROPICALCYCLONE});
+    my ($bg)=$self->_effective_value(q{BACKGROUNDMET});
+    my ($hpc)=$self->_effective_value(q{HPCENVSHORT});
+    my ($admin)=$self->_effective_value(q{ASGSADMIN_ID});
+    push @missing,q{GRIDNAME} unless defined $grid && length $grid && $grid ne q{null};
+    push @missing,q{TROPICALCYCLONE} unless defined $tc && length $tc;
+    push @missing,q{BACKGROUNDMET} unless defined $bg && length $bg;
+    push @missing,q{HPCENVSHORT} unless defined $hpc && length $hpc && $hpc ne q{null};
+    push @missing,q{ASGSADMIN_ID} unless defined $admin && length $admin && $admin ne q{null};
+
+    my ($storm,$year);
+    if (defined $tc && $tc ne q{off}) {
+        ($storm)=$self->_effective_value(q{STORM});
+        ($year)=$self->_effective_value(q{YEAR});
+        push @missing,q{STORM} unless defined $storm && $storm =~ /^\d+$/;
+        push @missing,q{YEAR} unless defined $year && $year =~ /^\d{4}$/;
+    }
+    return (undef,q{derived},\@missing) if @missing;
+
+    my $forcing=q{};
+    if ($bg eq q{on} || lc($bg) eq q{nam}) { $forcing=q{nam}; }
+    elsif (lc($bg) eq q{gfs}) { $forcing=q{gfs}; }
+    elsif (lc($bg) eq q{rrfs}) { $forcing=q{rrfs}; }
+    elsif ($bg ne q{off}) { $forcing=$bg; }
+    if ($tc ne q{off}) {
+        my $s=sprintf q{%02d},$storm;
+        $forcing = length($forcing) ? qq{al$s$year-$forcing} : qq{al$s$year};
+    }
+    return (join(q{_},$grid,$forcing,$hpc,$admin),q{derived},[]);
 }
 
-# hint: STATEFILE should only be defined in the environment and set by asgs_main.sh
-sub _extract_from_statefile {
-    my ( $self, $varname ) = @_;
-
-    return undef if not $STATEFILE;
-
-    local $/;
-    open my $FH, q{<}, $STATEFILE || die $!;
-    my $state = <$FH>;
-    close $FH;
-    return $self->_extract_from_string( $varname, $state );
+sub check_instance_name {
+    my ($self)=@_;
+    my $cfg=$self->_config_assignments;
+    if (exists $cfg->{INSTANCENAME} && defined $cfg->{INSTANCENAME}->value
+        && $cfg->{INSTANCENAME}->value ne q{auto}
+        && $cfg->{INSTANCENAME}->value =~ /\s/) {
+        $self->_finding(q{error},q{instance_name},q{Explicit INSTANCENAME must not contain whitespace.});
+        return;
+    }
+    my ($name,$src,$missing)=$self->_derive_instancename;
+    if ((!exists $cfg->{INSTANCENAME} || !defined $cfg->{INSTANCENAME}->value || $cfg->{INSTANCENAME}->value eq q{auto})
+        && !defined $name) {
+        $self->_finding(q{warning},q{instance_name},
+            q{INSTANCENAME will be derived by ASGS at runtime, but asgs-lint cannot reproduce it statically because these values are unavailable: }.
+            join(q{, },@$missing).q{.});
+    }
 }
 
-sub assert_FATAL($) {
-    my $MSG = shift;
-    my $errmsg = qq{(!!! assert_FATAL): $MSG};
-    push @$ERRORS, $errmsg;
+sub check_mesh_defaults_order {
+    my ($self)=@_;
+    my ($source_line,$target)=$self->_mesh_defaults_source_line;
+    return unless $source_line;
+    my $cfg=$self->_config_assignments;
+
+    if (!exists $cfg->{GRIDNAME} || $cfg->{GRIDNAME}->line > $source_line) {
+        $self->_finding(q{error},q{mesh_defaults_order},
+            "GRIDNAME must be assigned before mesh_defaults.sh is sourced at line $source_line.");
+    }
+    if (exists $cfg->{parameterPackage} && $cfg->{parameterPackage}->line > $source_line) {
+        $self->_finding(q{error},q{mesh_defaults_order},
+            "parameterPackage is assigned after mesh_defaults.sh is sourced at line $source_line; the selected mesh package has already been initialized.");
+    }
+}
+
+sub _lastsubdir_info {
+    my ($self,$last)=@_;
+    my $info=h2o {
+        kind=>q{invalid}, scheme=>undef, source=>undef, expected=>undef,
+        run_properties=>undef, run_coldstart=>undef, format=>undef, message=>undef,
+    };
+    return $info unless defined $last && length $last && $last ne q{null};
+    if ($last =~ m{^(https?)://([^/\s]+)(?:/[^\s]*)?$}i) {
+        $info->{kind}=q{remote}; $info->{scheme}=lc $1; $info->{source}=$last;
+        return $info;
+    }
+    if ($last =~ m{^(scp|ssh)://([^/\s]+)/([^\s]+)$}i) {
+        $info->{kind}=q{remote}; $info->{scheme}=lc $1; $info->{source}=$last;
+        return $info;
+    }
+    if ($last =~ m{^[A-Za-z][A-Za-z0-9+.-]*://}) {
+        $info->{message}=q{unsupported URL scheme}; return $info;
+    }
+    if ($last =~ /[\r\n\0]/ || $last =~ /\s/) {
+        $info->{message}=q{local LASTSUBDIR contains whitespace/control characters}; return $info;
+    }
+    $info->{kind}=q{local}; $info->{scheme}=q{file}; $info->{source}=$last;
+    return $info;
+}
+
+sub _netcdf_signature {
+    my ($self,$file)=@_;
+    open my $fh,'<:raw',$file or return q{unreadable};
+    read($fh,my $head,8);
+    close $fh;
+    return q{netcdf3} if substr($head,0,3) eq q{CDF} && length($head) >= 4 && ord(substr($head,3,1)) =~ /^(?:1|2|5)$/;
+    return q{netcdf4} if $head eq "\x89HDF\x0d\x0a\x1a\x0a";
+    return q{unknown};
+}
+
+sub check_config_file {
+    my ($self)=@_;
+    my $file=$self->{config};
+    if (!$file) { $self->_finding(q{error},q{config_file},q{ASGS_CONFIG is not defined.}); return; }
+    if (!-e $file) { $self->_finding(q{error},q{config_file},"ASGS_CONFIG '$file' does not exist."); return; }
+    if (!-r $file) { $self->_finding(q{error},q{config_file},"ASGS_CONFIG '$file' is not readable."); return; }
+    my $data=$self->_slurp($file,1);
+    if ($data =~ /\x00/) { $self->_finding(q{error},q{config_file},q{ASGS_CONFIG contains NUL bytes.}); }
+    if ($data =~ /\r\n/) { $self->_finding(q{error},q{config_file},q{ASGS_CONFIG contains Windows CRLF line endings.}); }
+    if ($data =~ /\r(?!\n)/) { $self->_finding(q{error},q{config_file},q{ASGS_CONFIG contains old Mac CR line endings.}); }
+    my $probe=$data;
+    eval { Encode::decode(q{UTF-8},$probe,Encode::FB_CROAK); 1 } or $self->_finding(q{error},q{config_file},q{ASGS_CONFIG contains invalid UTF-8.});
+    $self->{config_text}=Encode::decode(q{UTF-8},$data);
+    $self->{config_vars}=undef;
+}
+
+sub check_disallowed {
+    my ($self)=@_; return unless length $self->_config_text;
+    my $vars=$self->_config_assignments;
+    for my $name (@$CONFIG_DISALLOWED) {
+        $self->_finding(q{error},q{disallowed_config_vars},"'$name' should not be assigned in ASGS_CONFIG.") if exists $vars->{$name};
+    }
+}
+
+sub _is_posint { defined $_[0] && $_[0] =~ /^\d+$/ && $_[0] >= 1 }
+sub _is_email { defined $_[0] && $_[0] =~ /^[A-Za-z0-9._%+\-]+\@(?:[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$/ }
+
+sub check_required_and_values {
+    my ($self)=@_; return unless length $self->_config_text;
+    for my $name (sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS) {
+        next unless $CONFIG_VARS->$name->req;
+        my ($v)=$self->_effective_value($name);
+        $self->_finding(q{error},q{required_vars},"'$name' is not defined. $CONFIG_VARS->{$name}->{hint}") unless defined $v && length $v;
+    }
+    for my $name (qw/PPN NCPU NCPUCAPACITY/) { my ($v)=$self->_effective_value($name); $self->_finding(q{error},q{required_vars},"$name must be an integer greater than 0.") if defined $v && !_is_posint($v); }
+    my ($nw)=$self->_effective_value(q{NUMWRITERS}); $self->_finding(q{error},q{required_vars},q{NUMWRITERS must be integer 1.}) if defined $nw && $nw !~ /^1$/;
+    my ($email)=$self->_effective_value(q{ASGSADMIN}); $self->_finding(q{error},q{required_vars},q{ASGSADMIN must be an email address.}) if defined $email && !_is_email($email);
+    for my $pair ([WAVES=>[qw/on off/]], [TROPICALCYCLONE=>[qw/on off/]], [EMAILNOTIFY=>[qw/yes no/]], [createWind10mLayer=>[qw/yes no/]], [REINITIALIZESWAN=>[qw/yes no/]], [QUEUESYS=>[qw/mpiexec SLURM PBS/]], [HOTSTARTFORMAT=>[qw/binary netcdf netcdf3/]]) {
+        my ($name,$allowed)=@$pair; my ($v)=$self->_effective_value($name); next unless defined $v; my %ok=map {$_=>1} @$allowed; $self->_finding(q{error},q{required_vars},"$name='$v' is invalid; expected one of: ".join(q{, },@$allowed).q{.}) unless $ok{$v};
+    }
+}
+
+sub check_forcing {
+    my ($self)=@_;
+    my ($bg)=$self->_effective_value(q{BACKGROUNDMET}); my ($tc)=$self->_effective_value(q{TROPICALCYCLONE});
+    return unless defined $bg && defined $tc;
+    my %bg=map {$_=>1} qw/on off NAM OWI namBlend GFS gfsBlend RRFS rrfsBlend/;
+    $self->_finding(q{error},q{forcing},"BACKGROUNDMET='$bg' is invalid.") unless $bg{$bg};
+    return unless $bg{$bg};
+    $self->_finding(q{error},q{forcing},q{BACKGROUNDMET and TROPICALCYCLONE cannot both be off.}) if $bg eq q{off} && $tc eq q{off};
+    $self->_finding(q{error},q{forcing},q{BACKGROUNDMET=on and TROPICALCYCLONE=on are not compatible.}) if $bg eq q{on} && $tc eq q{on};
+    $self->_finding(q{error},q{forcing},"BACKGROUNDMET=$bg requires TROPICALCYCLONE=on.") if $bg =~ /^(?:namBlend|gfsBlend|rrfsBlend)$/ && $tc ne q{on};
+}
+
+sub check_cpu {
+    my ($self)=@_; my ($n)=$self->_effective_value(q{NCPU}); my ($w)=$self->_effective_value(q{NUMWRITERS}); my ($cap)=$self->_effective_value(q{NCPUCAPACITY});
+    if (_is_posint($n) && _is_posint($w) && _is_posint($cap) && $n+$w>$cap) { $self->_finding(q{error},q{cpu_capacity},"NCPU + NUMWRITERS ($n + $w) exceeds NCPUCAPACITY=$cap."); }
+    my ($ser)=$self->_effective_value(q{SERQUEUE_NTASKS}); my ($ppn)=$self->_effective_value(q{PPN});
+    if (defined $ser && length $ser) {
+        if (!_is_posint($ser)) { $self->_finding(q{error},q{serqueue_ntasks},"SERQUEUE_NTASKS='$ser' must be an integer between 1 and PPN."); }
+        elsif (_is_posint($ppn) && $ser>$ppn) { $self->_finding(q{error},q{serqueue_ntasks},"SERQUEUE_NTASKS=$ser exceeds effective PPN=$ppn."); }
+    }
+}
+
+sub check_scenarios {
+    my ($self)=@_; my $sc=$self->{scenarios}=$self->_parse_scenarios;
+    if (!$sc->found) { $self->_finding(q{warning},q{scenario_structure},q{No statically recognizable 'case $si in' scenario package was found.}); return; }
+    for my $idx (keys %{ $sc->cases }) { if (@{ $sc->cases->{$idx}->duplicate_lines }) { $self->_finding(q{error},q{scenario_structure},"Scenario case '$idx' is defined more than once."); } }
+    for my $pair ([-2=>q{hindcast}],[-1=>q{nowcast}]) {
+        my ($idx,$expected)=@$pair; if (!exists $sc->cases->{$idx}) { $self->_finding(q{error},q{scenario_structure},"Scenario package is missing required case $idx ($expected)."); next; }
+        my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM};
+        $self->_finding(q{error},q{scenario_structure},"Scenario case $idx should identify '$expected'.") if !defined $v || $v ne $expected;
+    }
+    $self->_finding(q{error},q{scenario_structure},q{Scenario package is missing wildcard '*' error/default branch.}) unless exists $sc->cases->{'*'};
+    my @numeric=sort {$a<=>$b} grep {/^[0-9]+$/} keys %{ $sc->cases };
+    if (@numeric) {
+        for my $expected (0..$#numeric) { if ($numeric[$expected] != $expected) { $self->_finding(q{error},q{scenario_structure},'Forecast scenario indices must be contiguous starting at 0; found: '.join(q{, },@numeric).q{.}); last; } }
+        my %seen;
+        for my $idx (@numeric) {
+            my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM};
+            if (!defined $v || $v eq q{}) { $self->_finding(q{error},q{scenario_structure},"Forecast case $idx does not set SCENARIO or legacy ENSTORM."); next; }
+            $self->_finding(q{error},q{scenario_structure},"Forecast scenario '$v' is used by more than one case.") if $seen{$v}++;
+        }
+    } else { $self->_finding(q{warning},q{scenario_structure},q{Scenario package contains no nonnegative forecast scenarios.}); }
+
+    my ($wind)=$self->_effective_value(q{createWind10mLayer});
+    if (defined $wind && $wind eq q{yes}) {
+        my $cv=$self->_config_assignments;
+        $self->_finding(q{error},q{wind10m},q{SCENARIOPACKAGESIZE must not be actively set when createWind10mLayer=yes.}) if exists $cv->{SCENARIOPACKAGESIZE};
+        for my $idx (@numeric) { my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM}; $self->_finding(q{error},q{wind10m},"Forecast case $idx uses obsolete explicit Wind10m scenario '$v' while createWind10mLayer=yes.") if defined $v && $v =~ /Wind10m$/i; }
+    }
+
+    my ($bg)=$self->_effective_value(q{BACKGROUNDMET}); my ($tc)=$self->_effective_value(q{TROPICALCYCLONE});
+    my %expected=(on=>q{namforecast},NAM=>q{namforecast},GFS=>q{gfsforecast},RRFS=>q{rrfsforecast},namBlend=>q{namforecast},gfsBlend=>q{gfsforecast},rrfsBlend=>q{rrfsforecast});
+    if (defined $bg && exists $expected{$bg}) {
+        for my $idx (@numeric) { my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM}; next unless defined $v; next if $v eq $expected{$bg}; next if $v eq $expected{$bg}.q{Wind10m} && (!defined $wind || $wind ne q{yes}); $self->_finding(q{error},q{scenario_forcing},"Forecast scenario '$v' is inconsistent with BACKGROUNDMET=$bg; expected '$expected{$bg}' family."); }
+    }
+    if (defined $bg && $bg eq q{off} && defined $tc && $tc eq q{on}) {
+        for my $idx (@numeric) { my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM}; next unless defined $v; if ($v =~ /^(?:nam|gfs|rrfs)forecast(?:Wind10m)?$/i) { $self->_finding(q{error},q{scenario_forcing},"Forecast scenario '$v' looks like background-meteorology forcing but BACKGROUNDMET=off and TROPICALCYCLONE=on."); } }
+    }
+}
+
+sub check_platform {
+    my ($self)=@_; my $p=$self->_resolve_platform; return unless $p;
+    my $cfg=$self->_config_assignments;
+    for my $name (@PLATFORM_VARS) {
+        my $pv=(exists $p->vars->{$name}) ? $p->vars->{$name}->value : undef;
+        my $ev=(exists $ENV{$name} && length($ENV{$name}//q{})) ? $ENV{$name} : undef;
+        my $cv=(exists $cfg->{$name}) ? $cfg->{$name}->value : undef;
+        if (defined $pv && defined $ev && $pv ne $ev) { $self->_finding(q{warning},q{platform_provenance},"$name differs between platform ('$pv') and current environment ('$ev'); this may be an intentional profile override."); }
+        if (defined $cv) {
+            my $base=defined $ev ? $ev : $pv;
+            if (defined $base && $cv ne $base) { $self->_finding(q{warning},q{platform_provenance},"ASGS_CONFIG overrides $name='$base' with '$cv'."); }
+        }
+    }
+}
+
+sub check_hotstart {
+    my ($self)=@_;
+    my ($hc)=$self->_effective_value(q{HOTORCOLD});
+    my ($last)=$self->_effective_value(q{LASTSUBDIR});
+    my ($cs)=$self->_effective_value(q{COLDSTARTDATE});
+    return unless defined $hc;
+
+    if ($hc !~ /^(?:coldstart|hotstart)$/) {
+        $self->_finding(q{error},q{hotstart},"HOTORCOLD='$hc' is invalid.");
+        return;
+    }
+
+    if (defined $cs) {
+        my $valid = ($cs =~ /^\d{10}$/ || $cs eq q{auto} || $cs eq q{$(get-coldstart-date)});
+        $self->_finding(q{error},q{hotstart},
+            "COLDSTARTDATE='$cs' is not a recognized static ASGS cold-start date or helper expression.") unless $valid;
+        if ($hc eq q{coldstart} && $cs eq q{auto}) {
+            $self->_finding(q{error},q{hotstart},
+                q{COLDSTARTDATE=auto is not valid for HOTORCOLD=coldstart; use an explicit YYYYMMDDHH value or $(get-coldstart-date).});
+        }
+    }
+
+    if ($hc eq q{coldstart}) {
+        if (defined $last && length $last && $last ne q{null}) {
+            $self->_finding(q{error},q{hotstart},
+                "LASTSUBDIR='$last' is set while HOTORCOLD=coldstart; ASGS will not use it for a true coldstart. Set LASTSUBDIR=null/remove it or select HOTORCOLD=hotstart.");
+        }
+        return;
+    }
+
+    if (!defined $last || $last eq q{} || $last eq q{null}) {
+        $self->_finding(q{error},q{hotstart},q{LASTSUBDIR must be set to a supported URL or local hotstart directory when HOTORCOLD=hotstart.});
+        return;
+    }
+
+    my $info=$self->_lastsubdir_info($last);
+    if ($info->kind eq q{invalid}) {
+        $self->_finding(q{error},q{hotstart},"LASTSUBDIR='$last' is not a valid ASGS hotstart location".
+            (defined $info->message ? " ($info->{message})" : q{}).q{.});
+        return;
+    }
+
+    my ($fmt)=$self->_effective_value(q{HOTSTARTFORMAT});
+    $fmt=q{netcdf} unless defined $fmt && length $fmt; # config/io_defaults.sh default
+    $info->{format}=$fmt;
+
+    if ($info->kind eq q{remote}) {
+        $info->{run_properties}=$last.q{/run.properties};
+        $info->{expected}=$last.q{/fort.68}.($fmt eq q{binary} ? q{} : q{.nc});
+        $self->{hotstart_info}=$info;
+        return;
+    }
+
+    if (!-d $last) {
+        $self->_finding(q{error},q{hotstart},"Local LASTSUBDIR '$last' does not exist or is not a directory.");
+        $self->{hotstart_info}=$info;
+        return;
+    }
+
+    my $from;
+    for my $d (qw/hindcast nowcast remote/) {
+        my $candidate=File::Spec->catdir($last,$d);
+        if (-d $candidate) { $from=$candidate; last; }
+    }
+    if (!$from) {
+        $self->_finding(q{error},q{hotstart},
+            "Local LASTSUBDIR '$last' must contain a hindcast, nowcast, or remote subdirectory; ASGS searches them in that order.");
+        $self->{hotstart_info}=$info;
+        return;
+    }
+    $info->{source}=$from;
+    my $rp=File::Spec->catfile($from,q{run.properties});
+    $info->{run_properties}=$rp;
+    if (!-f $rp) {
+        $self->_finding(q{error},q{hotstart},"Local hotstart source '$from' is missing required run.properties.");
+    } else {
+        my $rp_text=$self->_slurp($rp);
+        my ($rp_cs) = defined $rp_text && $rp_text =~ /^\s*ColdStartTime\s*:\s*(\d{10})\s*$/m ? $1 : undef;
+        $info->{run_coldstart}=$rp_cs;
+        if (!defined $rp_cs) {
+            $self->_finding(q{error},q{hotstart},
+                "Local hotstart run.properties '$rp' does not contain a valid ten-digit ColdStartTime value.");
+        } elsif (defined $cs && $cs =~ /^\d{10}$/ && $cs ne $rp_cs) {
+            $self->_finding(q{warning},q{hotstart},
+                "COLDSTARTDATE=$cs differs from ColdStartTime=$rp_cs in '$rp'; current ASGS uses the run.properties value for the hotstart.");
+        }
+    }
+
+    my $hot = $fmt eq q{binary}
+        ? File::Spec->catfile($from,q{PE0000},q{fort.67})
+        : File::Spec->catfile($from,q{fort.67.nc});
+    $info->{expected}=$hot;
+    if (!-f $hot) {
+        $self->_finding(q{error},q{hotstart},"Local hotstart file '$hot' was not found.");
+    } elsif (!-s $hot) {
+        $self->_finding(q{error},q{hotstart},"Local hotstart file '$hot' is empty.");
+    } elsif ($fmt eq q{netcdf} || $fmt eq q{netcdf3}) {
+        my $sig=$self->_netcdf_signature($hot);
+        my $wanted=$fmt eq q{netcdf3} ? q{netcdf3} : q{netcdf4};
+        if ($sig ne $wanted) {
+            $self->_finding(q{error},q{hotstart},
+                "Local hotstart file '$hot' does not have the expected $wanted container signature for HOTSTARTFORMAT=$fmt (detected $sig).");
+        }
+    }
+    $self->{hotstart_info}=$info;
+}
+
+sub check_vortex {
+    my ($self)=@_; my ($bg)=$self->_effective_value(q{BACKGROUNDMET}); my ($vm)=$self->_effective_value(q{VORTEXMODEL}); return unless defined $vm;
+    my %ok=map {$_=>1} qw/SYMMETRIC ASYMMETRIC GAHM/; $self->_finding(q{error},q{vortexmodel},"VORTEXMODEL='$vm' is invalid.") unless $ok{$vm};
+    $self->_finding(q{error},q{vortexmodel},"VORTEXMODEL=GAHM is incompatible with BACKGROUNDMET=$bg.") if $vm eq q{GAHM} && defined $bg && $bg =~ /^(?:namBlend|gfsBlend|rrfsBlend)$/;
+}
+
+sub check_trigger {
+    my ($self)=@_; my ($tr)=$self->_effective_value(q{TRIGGER}); my ($ftp)=$self->_effective_value(q{FTPSITE}); return unless defined $tr;
+    my %ok=map {$_=>1} qw/ftp rss rssembedded atcf/; $self->_finding(q{error},q{trigger},"TRIGGER='$tr' is invalid.") unless $ok{$tr};
+    $self->_finding(q{error},q{trigger},q{TRIGGER=ftp is not compatible with FTPSITE=filesystem.}) if defined $ftp && $tr eq q{ftp} && $ftp eq q{filesystem};
+}
+
+
+sub check_runtime_assets {
+    my ($self)=@_;
+    my $dir=$ENV{ADCIRCDIR};
+    my $bins=$ENV{ADCIRC_BINS};
+    if (!defined $dir || $dir eq q{} || !defined $bins || $bins eq q{}) {
+        $self->_finding(q{error},q{runtime_assets},q{ADCIRCDIR and ADCIRC_BINS must be available in the current environment.});
+        return;
+    }
+    for my $bin (grep { length } split /\s+/, $bins) {
+        my $path=File::Spec->catfile($dir,$bin);
+        $self->_finding(q{error},q{runtime_assets},"ADCIRC executable '$path' does not exist or is not executable.") unless -x $path;
+    }
+}
+
+sub check_waves {
+    my ($self)=@_; my ($waves)=$self->_effective_value(q{WAVES}); return unless defined $waves && $waves eq q{on};
+    my $adir=$ENV{ADCIRCDIR};
+    for my $bin (qw/adcswan padcswan/) { if (!$adir || !-x File::Spec->catfile($adir,$bin)) { $self->_finding(q{error},q{waves},"$bin must exist and be executable under ADCIRCDIR when WAVES=on."); } }
+    my $sdir=$ENV{SWANDIR};
+    if (!$sdir || !-x File::Spec->catfile($sdir,q{unhcat.exe})) { $self->_finding(q{error},q{waves},q{unhcat.exe must exist and be executable under SWANDIR when WAVES=on.}); }
+    my ($dt)=$self->_effective_value(q{SWANDT}); if (defined $dt && ($dt !~ /^\d+$/ || $dt<300 || $dt>1200)) { $self->_finding(q{error},q{waves},"SWANDT='$dt' should be an integer in the range 300..1200 when WAVES=on."); }
+    my ($r)=$self->_effective_value(q{REINITIALIZESWAN}); $self->_finding(q{error},q{waves},q{REINITIALIZESWAN must be yes or no when WAVES=on.}) if defined $r && $r !~ /^(?:yes|no)$/;
+}
+
+sub _run_checks {
+    my ($self)=@_;
+    $self->check_config_file;
+    return if !length $self->_config_text;
+    $self->check_disallowed;
+    $self->check_platform;
+    $self->check_instance_name;
+    $self->check_mesh_defaults_order;
+    $self->check_required_and_values;
+    $self->check_forcing;
+    $self->check_cpu;
+    $self->check_scenarios;
+    $self->check_hotstart;
+    $self->check_vortex;
+    $self->check_runtime_assets;
+    $self->check_trigger;
+    $self->check_waves;
+}
+
+sub _print_findings {
+    my ($self)=@_; my ($e,$w)=(0,0);
+    for my $f (@$FINDINGS) { my $tag=uc($f->severity); say sprintf q{[%s] %-22s %s},$tag,$f->rule,$f->message; $f->severity eq q{error} ? ++$e : ++$w; }
+    say sprintf q{Summary: %d error(s), %d warning(s).},$e,$w;
+    return ($e,$w);
+}
+
+sub _explain {
+    my ($self)=@_;
+    my $p=$self->_resolve_platform; my $sc=$self->{scenarios} || $self->_parse_scenarios;
+    say q{ASGS configuration summary}; say q{};
+    say q{Configuration}; say q{  File:                 }.$self->{config};
+    my ($inst,$instsrc,$missing)=$self->_derive_instancename; say q{  Instance:             }.(defined $inst?$inst:q{not resolved}).(defined $inst && defined $instsrc ? qq{ ($instsrc)} : q{});
+    say q{}; say q{Platform};
+    say q{  Definition style:     }.($p?$p->style:q{not resolved});
+    say q{  Definition file:      }.($p && $p->path?$p->path:q{not resolved});
+    say q{  Platform name:        }.($p?$p->name:q{not resolved});
+    say q{}; say q{Forcing};
+    for my $pair ([BACKGROUNDMET=>q{Background met}],[TROPICALCYCLONE=>q{Tropical cyclone}],[WAVES=>q{Waves}],[VARFLUX=>q{River forcing}],[createWind10mLayer=>q{Wind10m layer}]) { my ($v)=$self->_effective_value($pair->[0]); printf "  %-21s %s\n",$pair->[1].q{:},defined $v?$v:q{not resolved}; }
+    say q{}; say q{Scenario package};
+    if ($sc->found) { for my $idx (@{$sc->order}) { my $v=$sc->cases->{$idx}->vars->{SCENARIO} // $sc->cases->{$idx}->vars->{ENSTORM} // q{no scenario assignment}; printf "  %4s -> %s\n",$idx,$v; } } else { say q{  Not statically resolved.}; }
+    say q{}; say q{Compute};
+    for my $pair ([QUEUESYS=>q{Queue system}],[QUEUENAME=>q{Parallel queue}],[SERQUEUE=>q{Serial queue}],[PPN=>q{Processors/node}],[NCPU=>q{Compute ranks}],[NUMWRITERS=>q{Writers}],[SERQUEUE_NTASKS=>q{Serial job tasks}]) { my ($v,$src)=$self->_effective_value($pair->[0]); printf "  %-21s %s%s\n",$pair->[1].q{:},defined $v?$v:q{not resolved},defined $src?" ($src)":q{}; }
+    say q{}; say q{Startup};
+    my ($hc)=$self->_effective_value(q{HOTORCOLD}); my ($cs)=$self->_effective_value(q{COLDSTARTDATE}); my ($last)=$self->_effective_value(q{LASTSUBDIR});
+    printf "  %-21s %s\n",q{Mode:},defined $hc?$hc:q{not resolved};
+    printf "  %-21s %s\n",q{Cold-start date:},defined $cs?$cs:q{not resolved};
+    printf "  %-21s %s\n",q{LASTSUBDIR:},defined $last?$last:q{not set};
+    if ($self->{hotstart_info}) { my $hi=$self->{hotstart_info}; printf "  %-21s %s\n",q{Hotstart source:},defined $hi->source?$hi->source:q{not resolved}; printf "  %-21s %s\n",q{Expected hotstart:},defined $hi->expected?$hi->expected:q{not resolved}; printf "  %-21s %s\n",q{Run ColdStartTime:},$hi->run_coldstart if defined $hi->run_coldstart; }
+    say q{}; say q{Interpretation};
+    my ($bg)=$self->_effective_value(q{BACKGROUNDMET}); my ($tc)=$self->_effective_value(q{TROPICALCYCLONE});
+    if (defined $bg && $bg =~ /^(?:on|NAM)$/) { say q{  NAM background-meteorology configuration.}; }
+    elsif (defined $bg && $bg eq q{GFS}) { say q{  GFS background-meteorology configuration.}; }
+    elsif (defined $bg && $bg eq q{RRFS}) { say q{  RRFS background-meteorology configuration.}; }
+    elsif (defined $bg && $bg eq q{off} && defined $tc && $tc eq q{on}) { say q{  Tropical-cyclone/ATCF configuration without background meteorology.}; }
+    elsif (defined $bg && $bg =~ /Blend$/) { say qq{  Tropical/blended meteorology configuration ($bg).}; }
+    else { say q{  Forcing mode could not be summarized confidently.}; }
+    my ($e,$w)=(0,0); for my $f (@$FINDINGS){$f->severity eq q{error}?++$e:++$w} say qq{  Lint findings: $e error(s), $w warning(s).};
+}
+
+sub _show_rules {
+    say q{Rules enforced by asgs-lint:};
+    for my $name (sort {$RULES->$a->ord <=> $RULES->$b->ord} keys %$RULES) { printf "  %-22s %-7s %-10s %s\n",$name,'['.$RULES->$name->severity.']',$RULES->$name->category,$RULES->$name->summary; }
 }
 
 sub _show_help {
-    print <<EOHELP;
+    print <<'HELP';
+asgs-lint - strict static ASGS configuration checker
 
-asgs-lint ($VERSION) ... A very strict, static ASGS configuration file checker.
+Usage:
+  asgs-lint [--config FILE] [--explain] [-v]
+  asgs-lint --list vars
+  asgs-lint --list disallowed
+  asgs-lint --list rules
+  asgs-lint --help
 
-Quick Start - no options are required if ASGS_CONFIG is set:
-
-  1. ./asgsh
-  2. load profile # (select profile)
-  3. asgs-lint    # command is available via PATH
-  4. if asgs-lint finds an issue with the config it'll exit;
-     fix the issue and rerun until there are no more issues
-     found
-
-
-Description:
-
-  Run inside of asgsh with a profile loaded, without any options ASGS_CONFIG
-  is examined for required or highly recommended settings. asgs-lint fails
-  on the first problem found. Fix the problem, then run again - until there
-  are no more issues found.
-
-  This tool is a static analysis tool; meaning it examines the text of ASGS_CONFIG
-  and any files contained herein as long as the file paths may be determined
-  with out executing or `source`'ing any shell scripts.
-
-Advanced Usage:
-
-  --help                         This help text
-  --config path/to/config.sh     Check a config other than ASGS_CONFIG
-  --list vars                    Summary of required variables and descriptions
-  --list disallowed              Summary of variables forbidden because they conflict
-                                 with important environmental variables
-
-Maintenance Note:
-
-This script is meant to be updated whenever new static checks
-are needed; usually as a result of a long debugging session that
-could have been caught using a static checker tool like this one.
-
-EOHELP
+The linter never sources ASGS_CONFIG, PLATFORM_INIT, ASGS_PLATFORMS, or other
+shell files. It parses only statically recognizable text and accumulates all
+errors and warnings that can be derived safely.
+HELP
 }
-
-#
-# M A I N  D R I V E R
-#
 
 sub run {
-    my ($argv) = @_;
-    local %ENV = %ENV;
-
-    my $o = Getopt2h2o \@ARGV, {}, qw/config=s help list=s v/;
-
-    my $self = bless {}, __PACKAGE__;
-
-    if ( $o->help ) {
-        $self->_show_help;
-        return EXIT_SUCCESS;
+    my ($argv)=@_;
+    local @ARGV = @{ $argv || \@ARGV };
+    local %ENV=%ENV;
+    _reset_findings();
+    my $o=Getopt2h2o \@ARGV, {}, qw/config=s explain help list=s v/;
+    my $config=$o->config || $ENV{ASGS_CONFIG};
+    my $self=bless { config=>$config, verbose=>$o->v },__PACKAGE__;
+    if ($o->help) { $self->_show_help; return EXIT_SUCCESS; }
+    if ($o->list) {
+        if ($o->list eq q{vars}) { for my $name(sort {$CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord} keys %$CONFIG_VARS){ printf "%s %-20s %s\n",$CONFIG_VARS->$name->req?q{[required]}:q{[optional]},$name,$CONFIG_VARS->$name->hint; } return EXIT_SUCCESS; }
+        if ($o->list eq q{disallowed}) { say for @$CONFIG_DISALLOWED; return EXIT_SUCCESS; }
+        if ($o->list eq q{rules}) { $self->_show_rules; return EXIT_SUCCESS; }
+        say STDERR "Unknown --list target '$o->{list}'."; return EXIT_ERROR;
     }
-
-    if ( $o->list and $o->list eq q{vars} ) {
-        foreach my $var ( sort { $CONFIG_VARS->$a->ord <=> $CONFIG_VARS->$b->ord } keys %$CONFIG_VARS ) {
-            my $req = ( $CONFIG_VARS->$var->req ) ? q{[required]} : q{[optional]};
-            printf qq{%s %-19s %s\n}, $req, $var, $CONFIG_VARS->$var->hint;
-        }
-        return EXIT_SUCCESS;
-    }
-
-    if ( $o->list and $o->list eq q{disallowed} ) {
-        foreach my $var (@$CONFIG_DISALLOWED) {
-            printf qq{%s\n}, $var;
-        }
-        return EXIT_SUCCESS;
-    }
-
-    if ( $o->config ) {
-        $ASGS_CONFIG = $o->config;
-        printf qq{Linting configuration file, '%s' ...\n}, $ASGS_CONFIG;
-    }
-
-  DO_FATAL:
-    foreach my $check ( sort { $assert_checks->{$a} <=> $assert_checks->{$b} } keys %$assert_checks ) {
-        $self->$check($o);
-    }
-
-    for my $error (@$ERRORS) {
-      say $error;
-    }
-
-    return (@$ERRORS) ? EXIT_ERROR : EXIT_SUCCESS;
+    say "Linting configuration file, '$config' ..." if $o->config;
+    $self->_run_checks;
+    $self->_explain if $o->explain && length $self->_config_text;
+    my ($errors)=$self->_print_findings;
+    return $errors ? EXIT_ERROR : EXIT_SUCCESS;
 }
 
-exit run( \@ARGV // [] ) if not caller;
-
+exit run(\@ARGV) if not caller;
 1;
+
+__END__
+
+=head1 NAME
+
+asgs-lint - strict static analysis for ADCIRC Surge Guidance System configurations
+
+=head1 SYNOPSIS
+
+  asgs-lint
+  asgs-lint --config /path/to/asgs_config.sh
+  asgs-lint --explain
+  asgs-lint --list rules
+  asgs-lint --list vars
+  asgs-lint --list disallowed
+
+=head1 DESCRIPTION
+
+C<asgs-lint> is a single-file Perl modulino that statically inspects an ASGS
+configuration and related, statically discoverable platform definitions. It is
+designed to catch configuration errors before an ASGS run begins.
+
+Static means static: the linter does not C<source> shell files, invoke command
+substitutions, or execute configuration code. Values are derived only when they
+can be recognized safely from file text and the already-existing process
+environment.
+
+The linter accumulates all errors and warnings it can detect and reports them
+together. It does not intentionally stop after the first finding.
+
+=head1 CONFIGURATION PRECEDENCE AND PROVENANCE
+
+For checks implemented in this release, values may come from the current
+environment, a platform definition, or ASGS_CONFIG. Current ASGS runtime
+semantics ultimately allow explicit ASGS_CONFIG assignments to override values
+established before the config is sourced. The linter reports provenance and
+potential overrides but does not execute shell startup code to reconstruct an
+environment.
+
+New-style platforms are inspected through C<$PLATFORM_INIT> when it names a
+readable file. Older platforms are inspected through C<$ASGS_PLATFORMS>, which
+normally points to C<$SCRIPTDIR/platforms.sh>; the linter attempts to locate the
+matching C<init_PLATFORM()> function using C<ASGS_MACHINE_NAME> or
+C<HPCENVSHORT>.
+
+Simple shell assignments and simple variable references can be resolved.
+Command substitution and other executable shell syntax are deliberately left
+unresolved.
+
+=head1 OPTIONS
+
+=head2 --config FILE
+
+Lint FILE instead of the path in C<ASGS_CONFIG>.
+
+=head2 --explain
+
+Print an interpreted summary of the important configuration characteristics:
+platform source, forcing mode, scenario package, compute layout, and finding
+counts. This is intentionally not a raw variable dump.
+
+=head2 --list rules
+
+Print the maintained rule registry, including severity, category, and a short
+summary of each rule.
+
+=head2 --list vars
+
+Print known configuration variables, whether they are required, and their
+purpose or expected values.
+
+=head2 --list disallowed
+
+Print variables that are considered environment/profile-owned and therefore
+must not be assigned in ASGS_CONFIG.
+
+=head2 --help
+
+Print concise command-line help.
+
+=head2 -v
+
+Enable verbose diagnostics where implemented.
+
+=head1 FINDING SEVERITIES
+
+=head2 error
+
+A statically provable invalid or unsupported configuration state. Any error
+causes a nonzero exit status.
+
+=head2 warning
+
+A suspicious, deprecated, ambiguous, or provenance-related condition that can
+be valid in some deployments. Warnings are accumulated and displayed but do
+not by themselves cause failure.
+
+=head1 RULES ENFORCED
+
+The authoritative summary is generated by C<--list rules> from the rule
+registry embedded in this script. Major rule families include file/encoding
+checks, required variables, forcing compatibility, scenario structure,
+Wind10m behavior, compute capacity, serial queue task bounds, platform
+provenance, automatic instance naming, mesh-default ordering, hotstart consistency,
+vortex-model compatibility, wave settings,
+and trigger/source consistency.
+
+=head1 SERQUEUE_NTASKS
+
+C<SERQUEUE_NTASKS> is optional. When it is defined, the effective value must be
+an integer greater than or equal to 1 and less than or equal to the effective
+C<PPN>. The effective PPN may come from ASGS_CONFIG, the current environment,
+or a statically inspected platform definition.
+
+=head1 SCENARIO PACKAGE ANALYSIS
+
+The linter finds the first statically recognizable C<case $si in> block without
+using C<SCENARIOPACKAGESIZE> as an anchor. It expects the conventional C<-2>
+hindcast and C<-1> nowcast branches, contiguous nonnegative forecast cases
+beginning at zero, and a wildcard branch. Forecast cases must set C<SCENARIO>
+or legacy C<ENSTORM>.
+
+Where the forcing family makes the expected forecast scenario unambiguous, the
+linter checks it. Current conservative mappings include NAM, GFS, RRFS, and the
+corresponding blend families. Tropical/ATCF configurations are checked for
+obviously incompatible background-only scenarios without attempting to impose
+a complete list of valid perturbation names.
+
+=head1 WIND10M
+
+When C<createWind10mLayer=yes>, modern ASGS generates the Wind10m layer as part
+of the normal forecast workflow. In that mode an active C<SCENARIOPACKAGESIZE>
+assignment is rejected and explicit forecast scenario names ending in
+C<Wind10m> are rejected as obsolete two-run configuration.
+
+=head1 PLATFORM ANALYSIS
+
+Platform files are parsed, never sourced. For new-style platforms the linter
+uses C<PLATFORM_INIT>. For old-style platforms it uses C<ASGS_PLATFORMS> and
+attempts to inspect C<init_PLATFORM()>.
+
+For key scheduler/platform variables the linter compares values visible in the
+platform definition, current environment, and explicit configuration. A
+platform/environment difference is a warning because an operator profile may
+intentionally override a platform default. A differing explicit config value
+is also reported because it becomes the effective runtime value after the
+config is sourced.
+
+=head1 INSTANCE NAME DERIVATION
+
+C<INSTANCENAME> is optional because current ASGS derives it when it is omitted or
+set to C<auto>. When C<GRIDNAME>, forcing values, C<HPCENVSHORT>,
+C<ASGSADMIN_ID>, and (for tropical runs) C<STORM>/C<YEAR> are statically
+available, C<asgs-lint> reproduces the current C<bin/get-instancename> naming
+rule without executing that script. If the inputs are incomplete, the linter
+warns that the runtime name cannot be reproduced but does not reject the config
+merely because C<INSTANCENAME> is absent.
+
+=head1 MESH DEFAULT INITIALIZATION ORDER
+
+When ASGS_CONFIG explicitly sources C<config/mesh_defaults.sh>, C<GRIDNAME>
+must already have been assigned because C<mesh_defaults.sh> dispatches directly
+on it. An explicitly configured C<parameterPackage> must also precede that
+source because mesh C<init.sh> files consume it during initialization.
+
+C<ADCIRCVERSION> and C<createWind10mLayer> are intentionally not made ordering
+errors in this release: current C<mesh_defaults.sh> does not itself consume
+those values. Their broader mesh/package semantics belong to the later static
+mesh/input derivation pass.
+
+=head1 COLD START AND HOTSTART ANALYSIS
+
+C<COLDSTARTDATE=$(get-coldstart-date)> is recognized as a valid ASGS expression
+without executing the command. A ten-digit C<YYYYMMDDHH> value is also valid.
+C<COLDSTARTDATE=auto> is rejected for a true C<HOTORCOLD=coldstart>, but is
+valid for hotstart operation, where current ASGS obtains the cold-start time
+from the associated C<run.properties>.
+
+For C<HOTORCOLD=hotstart>, C<LASTSUBDIR> must be non-null. Current ASGS accepts
+C<http://>, C<https://>, C<scp://>, and C<ssh://> remote locations. Remote
+resources are never contacted by the linter; their syntax and the expected
+C<run.properties>/C<fort.68[.nc]> names are derived only.
+
+A local C<LASTSUBDIR> is checked exactly according to the current ASGS search
+shape: the first existing C<hindcast>, C<nowcast>, or C<remote> subdirectory is
+the source directory. That directory must contain C<run.properties> and must
+contain C<fort.67.nc> for netCDF hotstarts or C<PE0000/fort.67> for binary
+hotstarts. Files must be nonempty. The local C<run.properties> must also contain
+a valid ten-digit C<ColdStartTime>; when an explicit ten-digit C<COLDSTARTDATE>
+differs, the linter warns because current ASGS uses the C<run.properties> value.
+For netCDF files the linter additionally checks the container magic bytes (HDF5/netCDF-4 or classic netCDF, according to
+C<HOTSTARTFORMAT>) without invoking C<ncdump>, C<hstime>, or any other program.
+Full C<fort.15>/C<IHOT> derivation is deliberately deferred to the later static
+mesh/input analysis phase.
+
+=head1 STATIC ANALYSIS LIMITATIONS
+
+The linter intentionally does not execute shell. It therefore cannot know the
+result of command substitution, arbitrary conditionals, loops, functions,
+external programs, or dynamically generated assignments unless the result is
+already present in the environment. Such values are reported or treated as
+unresolved rather than executed.
+
+This boundary is a feature: running C<asgs-lint> against an operator
+configuration must never have the side effects of sourcing that configuration.
+
+=head1 FUTURE STATIC ANALYSIS DIRECTIONS
+
+The internal provenance model is intended to support additional static checks
+without changing this safety model, including mesh/default package inspection,
+input-file expectation and availability checks, statefile inspection, and
+output-handling expectation checks. These are not implemented merely because a
+path can be discovered; they should be added only when the expectation can be
+derived without executing shell code.
+
+=head1 EXIT STATUS
+
+C<0> means no errors were found. Warnings may still have been reported.
+C<255> means one or more errors were found.
+
+=head1 MODULINO USE
+
+The script executes C<run()> only when invoked directly. Tests and developer
+tools may load the file and call package routines without triggering the CLI.
+The distributed runtime remains this single Perl script.
+
+=head1 DEVELOPMENT AND TESTING
+
+Tests should load the modulino and use fixture configurations and temporary
+platform definitions. Tests must include cases proving that shell command
+substitution or other executable syntax is never evaluated by the linter.
+
+=head1 VERSION
+
+Version 1.1.2.
+
+=head1 COPYRIGHT AND LICENSE
+
+This file is part of ASGS tooling and follows the licensing and attribution
+requirements of the ASGS/asgs-lint project.
+
+=cut
+
